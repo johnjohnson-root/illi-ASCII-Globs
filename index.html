@@ -1,0 +1,231 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ASCII post-process — minimal</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0a0a; overflow: hidden; }
+  canvas { display: block; }
+</style>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.180.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ---------------------------------------------------------------------------
+// CONFIG — the whole look lives here.
+// Values in comments are what dragonfly.xyz uses for its hero scene.
+// ---------------------------------------------------------------------------
+const CONFIG = {
+  characters: ' * _<>,  ./O#SF +',  // glyph ramp, darkest -> densest
+  charLimit:  15,                   // how many of them the luminance ramp maps onto (site: 16)
+  granularity: 6,                   // cell size in CSS px
+  fontSize:   72,                   // px, drawn into a 64px atlas cell
+  color:      '#eeeeee',            // glyph colour
+  background: '#0a0a0a',
+
+  // model shading
+  remapColor:     [0.85, 0.85, 0.85],  // site: [0.35, 0.35, 0.35] — much sparser glyphs
+  lightDir:       [0.0, 0.8, 1.0],
+  brightness:     0.5,
+  normalStrength: 1.5,
+
+  noise: true,
+};
+
+// ---------------------------------------------------------------------------
+// 1. GLYPH ATLAS — generated at runtime, no image asset.
+//    1024x1024 canvas, 16x16 grid of 64px cells, one character per cell.
+// ---------------------------------------------------------------------------
+function makeAtlas({ characters, fontSize }) {
+  const SIZE = 1024, GRID = 16, CELL = SIZE / GRID;
+  const canvas = document.createElement('canvas');
+  canvas.width = canvas.height = SIZE;
+
+  const ctx = canvas.getContext('2d');
+  ctx.font = `${fontSize}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = 'white';
+
+  characters.split('').forEach((char, i) => {
+    const col = i % GRID, row = Math.floor(i / GRID);
+    ctx.fillText(char, col * CELL + CELL / 2, row * CELL + CELL / 2);
+  });
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = texture.magFilter = THREE.NearestFilter;
+  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;  // charUV goes negative; repeat wraps it
+  return texture;
+}
+
+// ---------------------------------------------------------------------------
+// 2. SCENE PASS — mesh shaded from its normals only. No lights, no textures,
+//    no materials on the model itself. Renders into an offscreen target.
+// ---------------------------------------------------------------------------
+const sceneVert = /* glsl */`
+  varying vec3 vNormal;
+  void main() {
+    vNormal = normalize(normalMatrix * normal);
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const sceneFrag = /* glsl */`
+  uniform vec3  uRemapColor;
+  uniform vec3  uLightDir;
+  uniform float uBrightness;
+  uniform float uNormalStrength;
+  varying vec3  vNormal;
+
+  void main() {
+    vec3 normal = normalize(vNormal);
+    float diff  = max(dot(normal, normalize(uLightDir)), 0.0);
+
+    vec3 color = (diff * uBrightness) + normal * uNormalStrength + 0.5;
+    color = clamp(color, 0.15, 0.995);
+    color *= uRemapColor;
+
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+// ---------------------------------------------------------------------------
+// 3. ASCII PASS — fullscreen quad. Pixelate to a grid, read the cell's
+//    luminance, pick a glyph, sample the atlas.
+// ---------------------------------------------------------------------------
+const asciiVert = /* glsl */`
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = vec4(position.xy, 0.0, 1.0);
+  }
+`;
+
+const asciiFrag = /* glsl */`
+  precision highp float;
+
+  uniform sampler2D tDiffuse;
+  uniform sampler2D uCharactersTexture;
+  uniform vec2  uResolution;
+  uniform float uGranularity;
+  uniform float uCharactersLimit;
+  uniform vec3  uColor;
+  uniform vec3  uBackground;
+  uniform float uTime;
+  uniform bool  uNoise;
+
+  varying vec2 vUv;
+
+  const float GRID = 16.0;  // atlas is 16x16 cells
+
+  float grayscale(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+  float noise2D(vec2 p)   { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+
+  void main() {
+    // --- pixelation grid ---
+    vec2 division    = uResolution / uGranularity;
+    vec2 d           = 1.0 / division;
+    vec2 pixelizedUV = d * (floor(vUv / d) + 0.5);
+
+    vec4 pixelizedColor = texture2D(tDiffuse, pixelizedUV);
+    float gray = grayscale(pixelizedColor.rgb) * pixelizedColor.a;
+
+    // --- glyph selection ---
+    float charIndex = floor(gray * (uCharactersLimit - 1.0));
+    float charX = mod(charIndex, GRID);
+    float charY = floor(charIndex / GRID);
+
+    vec2 charUV = mod(vUv * (division / GRID), 1.0 / GRID);
+    charUV.y -= 1.0 / GRID;                       // canvas rows run top-down, UV runs bottom-up
+    charUV   += vec2(charX, -charY) / GRID;
+
+    float ascii = texture2D(uCharactersTexture, charUV).r;
+
+    // --- grain ---
+    if (uNoise) {
+      float n = noise2D(pixelizedUV * 120.0 + uTime * 0.0001);
+      ascii *= mix(0.6, 1.4, smoothstep(0.5, 0.9, n));
+    }
+
+    vec3 color = uColor * ascii;
+    gl_FragColor = vec4(mix(uBackground, color, clamp(ascii, 0.0, 1.0)), 1.0);
+  }
+`;
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x000000, 0);   // empty pixels stay alpha 0 -> darkest glyph
+document.body.appendChild(renderer.domElement);
+
+const target = new THREE.WebGLRenderTarget(1, 1);
+
+// -- pass 1
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
+camera.position.z = 5;
+
+const mesh = new THREE.Mesh(
+  new THREE.TorusKnotGeometry(1, 0.36, 220, 32),
+  new THREE.ShaderMaterial({
+    vertexShader: sceneVert,
+    fragmentShader: sceneFrag,
+    uniforms: {
+      uRemapColor:     { value: new THREE.Vector3(...CONFIG.remapColor) },
+      uLightDir:       { value: new THREE.Vector3(...CONFIG.lightDir) },
+      uBrightness:     { value: CONFIG.brightness },
+      uNormalStrength: { value: CONFIG.normalStrength },
+    },
+  })
+);
+scene.add(mesh);
+
+// -- pass 2
+const quadScene  = new THREE.Scene();
+const quadCamera = new THREE.Camera();
+const asciiMaterial = new THREE.ShaderMaterial({
+  vertexShader: asciiVert,
+  fragmentShader: asciiFrag,
+  uniforms: {
+    tDiffuse:           { value: target.texture },
+    uCharactersTexture: { value: makeAtlas(CONFIG) },
+    uResolution:        { value: new THREE.Vector2() },
+    uGranularity:       { value: CONFIG.granularity },
+    uCharactersLimit:   { value: CONFIG.charLimit },
+    uColor:             { value: new THREE.Color(CONFIG.color) },
+    uBackground:        { value: new THREE.Color(CONFIG.background) },
+    uTime:              { value: 0 },
+    uNoise:             { value: CONFIG.noise },
+  },
+});
+quadScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), asciiMaterial));
+
+function resize() {
+  const w = innerWidth, h = innerHeight, dpr = renderer.getPixelRatio();
+  renderer.setSize(w, h);
+  target.setSize(w * dpr, h * dpr);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  asciiMaterial.uniforms.uResolution.value.set(w, h);
+}
+addEventListener('resize', resize);
+resize();
+
+renderer.setAnimationLoop((t) => {
+  mesh.rotation.set(t * 0.0002, t * 0.0003, 0);
+  mesh.position.y = Math.sin(t * 0.0006) * 0.15;
+  asciiMaterial.uniforms.uTime.value = t;
+
+  renderer.setRenderTarget(target);
+  renderer.clear();
+  renderer.render(scene, camera);
+
+  renderer.setRenderTarget(null);
+  renderer.render(quadScene, quadCamera);
+});
+</script>
