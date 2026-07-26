@@ -5,10 +5,22 @@
 <style>
   html, body { margin: 0; height: 100%; background: #0a0a0a; overflow: hidden; }
   canvas { display: block; }
+  #hud {
+    position: fixed; left: 12px; bottom: 12px; z-index: 1;
+    font: 12px/1.6 ui-monospace, monospace; color: #666; white-space: pre;
+    pointer-events: none; user-select: none;
+  }
 </style>
 
+<div id="hud"></div>
+
 <script type="importmap">
-{ "imports": { "three": "https://unpkg.com/three@0.180.0/build/three.module.js" } }
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.180.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.180.0/examples/jsm/"
+  }
+}
 </script>
 
 <script type="module">
@@ -24,6 +36,7 @@ const CONFIG = {
   granularity: 6,                   // cell size in CSS px
   fontSize:   72,                   // px, drawn into a 64px atlas cell
   color:      '#eeeeee',            // glyph colour
+  accentColor:'#ff8033',            // trail highlight (site theme-orange: 1.0, 0.5, 0.2)
   background: '#0a0a0a',
 
   // model shading
@@ -33,7 +46,24 @@ const CONFIG = {
   normalStrength: 1.5,
 
   noise: true,
+  matrix: false,        // per-column vertical scroll
+  matrixSpeed: 0.15,    // screens per second at max column noise
+  smear: 0.0,           // 0..1 — how far up the waterfall collapse reaches
+  outProgress: 0.0,     // 0..1 — columns lift off the top
+  reveal: 1.0,          // threshold: 0 = fully visible, 1 = fully hidden
+
+  revealDuration: 1.4,  // seconds
+  exitDuration:   0.9,
+
+  // Point this at a .glb to replace the placeholder torus knot. Draco-compressed
+  // files work as-is; the decoder is vendored in libs/draco/. Any materials and
+  // textures in the file are discarded — the surface shader below replaces them.
+  model:     null,
+  dracoPath: 'libs/draco/',
+  fitRadius: 1.6,       // model is scaled so its bounding sphere matches this
 };
+
+const TRAIL_LENGTH = 40;
 
 // ---------------------------------------------------------------------------
 // 1. GLYPH ATLAS — generated at runtime, no image asset.
@@ -65,11 +95,27 @@ function makeAtlas({ characters, fontSize }) {
 // 2. SCENE PASS — mesh shaded from its normals only. No lights, no textures,
 //    no materials on the model itself. Renders into an offscreen target.
 // ---------------------------------------------------------------------------
+// The three.js chunks are what make this work on rigged models: without the
+// skinning includes a SkinnedMesh renders in bind pose and the animation is
+// silently ignored. three enables USE_SKINNING per-object, so the same material
+// serves both skinned and static meshes.
 const sceneVert = /* glsl */`
+  #include <common>
+  #include <skinning_pars_vertex>
+
   varying vec3 vNormal;
+
   void main() {
-    vNormal = normalize(normalMatrix * normal);
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    #include <beginnormal_vertex>
+    #include <skinbase_vertex>
+    #include <skinnormal_vertex>
+    #include <defaultnormal_vertex>
+
+    vNormal = normalize(transformedNormal);
+
+    #include <begin_vertex>
+    #include <skinning_vertex>
+    #include <project_vertex>
   }
 `;
 
@@ -78,6 +124,7 @@ const sceneFrag = /* glsl */`
   uniform vec3  uLightDir;
   uniform float uBrightness;
   uniform float uNormalStrength;
+  uniform float uReveal;
   varying vec3  vNormal;
 
   void main() {
@@ -88,15 +135,37 @@ const sceneFrag = /* glsl */`
     color = clamp(color, 0.15, 0.995);
     color *= uRemapColor;
 
-    gl_FragColor = vec4(color, 1.0);
+    // --- normal-based reveal wipe ---
+    // Y-facing surfaces appear first; a thin band rides the wipe front.
+    float edge       = 0.05;
+    float revealMask = dot(normal, vec3(0.0, 1.0, 0.0)) * 0.5 + 0.5;
+
+    float visible  = step(uReveal, revealMask);
+    float edgeBand = smoothstep(uReveal - edge, uReveal, revealMask)
+                   - smoothstep(uReveal, uReveal + edge, revealMask);
+
+    // At uReveal = 0 there is no wipe front, but the band still latches onto
+    // fully down-facing normals. Fade it out over the last of the wipe.
+    edgeBand *= smoothstep(0.0, edge, uReveal);
+
+    // Not in the original: stops hidden fragments writing depth and punching
+    // holes through geometry behind them. Visually identical either way.
+    if (visible < 0.5) discard;
+
+    // rgb only ever survives as luminance, so the band is smuggled out through
+    // alpha for the ASCII pass to tint. Alpha now means: 0 = nothing drawn here,
+    // 0.5 = plain surface, 1.0 = full edge band.
+    color = mix(color, vec3(0.5, 0.8, 0.2), edgeBand);
+
+    gl_FragColor = vec4(color, 0.5 + 0.5 * clamp(edgeBand, 0.0, 1.0));
   }
 `;
 
 // ---------------------------------------------------------------------------
-// 3. ASCII PASS — fullscreen quad. Pixelate to a grid, read the cell's
-//    luminance, pick a glyph, sample the atlas.
+// 3. MOUSE TRAIL PASS — quarter-res target. Not a ping-pong FBO: it redraws
+//    40 circles every frame from a chain of points that lerp toward each other.
 // ---------------------------------------------------------------------------
-const asciiVert = /* glsl */`
+const quadVert = /* glsl */`
   varying vec2 vUv;
   void main() {
     vUv = uv;
@@ -104,18 +173,62 @@ const asciiVert = /* glsl */`
   }
 `;
 
+const trailFrag = /* glsl */`
+  #define TRAIL_LENGTH ${TRAIL_LENGTH}
+  #define PIXEL_SIZE 80.0
+
+  uniform vec2  uTrail[TRAIL_LENGTH];
+  uniform float uTrailStrength[TRAIL_LENGTH];
+  uniform float uVelocity;
+
+  varying vec2 vUv;
+
+  vec2 pixelate(vec2 uv, float pixels) {
+    return floor(uv * pixels) / pixels;
+  }
+
+  float circle(vec2 uv, vec2 center, float radius) {
+    return 1.0 - smoothstep(radius - 0.02, radius + 0.02, length(uv - center));
+  }
+
+  void main() {
+    vec2 uv = pixelate(vUv, PIXEL_SIZE);
+    float trail = 0.0;
+
+    for (int i = 0; i < TRAIL_LENGTH; i++) {
+      float fade     = 1.0 - float(i) / float(TRAIL_LENGTH);
+      float size     = uVelocity * 0.025 * fade;
+      float strength = uTrailStrength[i] * fade;
+      trail += circle(uv, uTrail[i], size) * strength;
+    }
+
+    trail = clamp(trail, 0.0, 1.0);
+    gl_FragColor = vec4(vec3(trail), trail * uVelocity);
+  }
+`;
+
+// ---------------------------------------------------------------------------
+// 4. ASCII PASS — fullscreen quad. Pixelate to a grid, read the cell's
+//    luminance, pick a glyph, sample the atlas.
+// ---------------------------------------------------------------------------
 const asciiFrag = /* glsl */`
   precision highp float;
 
   uniform sampler2D tDiffuse;
+  uniform sampler2D tMouseTrail;
   uniform sampler2D uCharactersTexture;
   uniform vec2  uResolution;
   uniform float uGranularity;
   uniform float uCharactersLimit;
   uniform vec3  uColor;
+  uniform vec3  uAccentColor;
   uniform vec3  uBackground;
   uniform float uTime;
+  uniform float uSmear;
+  uniform float uMatrixSpeed;
+  uniform float uOutProgress;
   uniform bool  uNoise;
+  uniform bool  uMatrix;
 
   varying vec2 vUv;
 
@@ -123,22 +236,110 @@ const asciiFrag = /* glsl */`
 
   float grayscale(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
   float noise2D(vec2 p)   { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+  float random(float x)   { return fract(sin(x) * 123456.789); }
+  float hash(float n)     { return fract(sin(n) * 43758.5453); }
 
   void main() {
+    vec2 screenUV = vUv;
+
     // --- pixelation grid ---
     vec2 division    = uResolution / uGranularity;
     vec2 d           = 1.0 / division;
-    vec2 pixelizedUV = d * (floor(vUv / d) + 0.5);
+    vec2 pixelizedUV = d * (floor(screenUV / d) + 0.5);
+
+    vec4 mouseTrail = texture2D(tMouseTrail, screenUV);
+
+    // --- matrix column motion ---
+    // Each column scrolls at its own rate. The glyph grid below is sampled at
+    // screenUV, so the cells stay put and only their content streams.
+    if (uMatrix) {
+      float noise = random(pixelizedUV.x);
+      pixelizedUV.y += uTime * uMatrixSpeed * abs(noise);
+      pixelizedUV.y  = fract(pixelizedUV.y);
+    }
+
+    // --- exit lift ---
+    // Computed here (before smear touches .x) but applied after it. Each column
+    // leaves at its own rate, so the frame empties raggedly rather than as a band.
+    float columnNoise = random(floor(pixelizedUV.x * division.x));
+    float exitLift    = uOutProgress * (1.2 + columnNoise);
+
+    // --- smear / waterfall ---
+    // Rows below the smear front collapse onto the bottom row and fade out.
+    float waterfallAlpha = 1.0;
+
+    if (uSmear > 0.0) {
+      float rowHeight = d.y;
+      float py        = clamp(pixelizedUV.y, 0.0, 1.0);
+
+      float rowIndex  = floor(py / rowHeight);
+      float totalRows = division.y;
+
+      float rowNoise     = hash(rowIndex * 17.0);
+      float edgeNoise    = hash(rowIndex * 21.0);
+      float stretchNoise = hash(rowIndex * 9.0 + 0.3);
+
+      float smearRows      = uSmear * totalRows;
+      float noiseAmount    = 0.35 * uSmear;
+      float noisySmearRows = smearRows + (rowNoise - 0.5) * noiseAmount * totalRows;
+
+      float blendRows = max(1.0, smearRows * 0.835);
+      float dist      = noisySmearRows - rowIndex;
+      float smearMask = clamp(dist / blendRows, 0.0, 1.0);
+      smearMask = pow(smearMask, mix(1.5, 3.0, edgeNoise));
+
+      float lastRowY   = rowHeight * 0.5;
+      float flowNoise  = hash(rowIndex * 31.0 + pixelizedUV.x * 13.0);
+      py -= flowNoise * rowHeight * smearMask * 0.6;
+      py  = mix(py, lastRowY, smearMask);
+
+      float depth   = 1.0 - (rowIndex / totalRows);
+      float stretch = 0.1 * uSmear;
+      stretch *= stretch;
+      stretch *= mix(0.6, 1.4, stretchNoise);
+
+      pixelizedUV.x = 0.5 + (pixelizedUV.x - 0.5) * (1.0 + stretch * smearMask);
+      pixelizedUV.y = py;
+
+      waterfallAlpha = mix(1.0, 0.05, depth * smearMask * uSmear);
+    }
+
+    // --- apply exit ---
+    pixelizedUV.y -= exitLift;
+
+    if (pixelizedUV.y < 0.0) {
+      gl_FragColor = vec4(uBackground, 1.0);
+      return;
+    }
 
     vec4 pixelizedColor = texture2D(tDiffuse, pixelizedUV);
-    float gray = grayscale(pixelizedColor.rgb) * pixelizedColor.a;
+
+    // alpha carries two things (see the scene shader): anything above 0.25 is
+    // surface, and whatever sits above 0.5 is the reveal wipe's edge band.
+    float visible = step(0.25, pixelizedColor.a);
+    float band    = clamp((pixelizedColor.a - 0.5) * 2.0, 0.0, 1.0) * visible;
+    float gray    = grayscale(pixelizedColor.rgb) * visible;
+
+    // --- edge detection, used to gate the trail ---
+    vec2 texel = 1.0 / uResolution;
+    float left  = grayscale(texture2D(tDiffuse, pixelizedUV + vec2(-texel.x, 0.0)).rgb);
+    float right = grayscale(texture2D(tDiffuse, pixelizedUV + vec2( texel.x, 0.0)).rgb);
+    float up    = grayscale(texture2D(tDiffuse, pixelizedUV + vec2(0.0,  texel.y)).rgb);
+    float down  = grayscale(texture2D(tDiffuse, pixelizedUV + vec2(0.0, -texel.y)).rgb);
+    float edgeMask = smoothstep(0.01, 0.25, length(vec2(right - left, up - down)));
 
     // --- glyph selection ---
-    float charIndex = floor(gray * (uCharactersLimit - 1.0));
+    // The trail overrides the glyph index, but only on edges — otherwise it
+    // punches flat holes through the middle of the shape.
+    float baseCharIndex  = floor(gray * (uCharactersLimit - 1.0));
+    float trailCharIndex = floor(mouseTrail.r * (uCharactersLimit - 1.0));
+    float trailInfluence = step(0.1, mouseTrail.r) * edgeMask;
+    float charIndex      = mix(baseCharIndex, trailCharIndex, trailInfluence);
+
     float charX = mod(charIndex, GRID);
     float charY = floor(charIndex / GRID);
 
-    vec2 charUV = mod(vUv * (division / GRID), 1.0 / GRID);
+    vec2 charUV = mod(screenUV * (division / GRID), 1.0 / GRID);
     charUV.y -= 1.0 / GRID;                       // canvas rows run top-down, UV runs bottom-up
     charUV   += vec2(charX, -charY) / GRID;
 
@@ -146,12 +347,19 @@ const asciiFrag = /* glsl */`
 
     // --- grain ---
     if (uNoise) {
-      float n = noise2D(pixelizedUV * 120.0 + uTime * 0.0001);
+      float n = noise2D(pixelizedUV * 120.0 + uTime * 0.1);
       ascii *= mix(0.6, 1.4, smoothstep(0.5, 0.9, n));
     }
 
-    vec3 color = uColor * ascii;
-    gl_FragColor = vec4(mix(uBackground, color, clamp(ascii, 0.0, 1.0)), 1.0);
+    ascii *= waterfallAlpha;
+
+    vec3 color = mix(uBackground, uColor * ascii, clamp(ascii, 0.0, 1.0));
+
+    // --- accent: trailed edges, plus the reveal wipe front ---
+    float accent = clamp(max(mouseTrail.r * edgeMask, band), 0.0, 1.0) * ascii;
+    color = mix(color, uAccentColor, accent);
+
+    gl_FragColor = vec4(color, 1.0);
   }
 `;
 
@@ -163,52 +371,162 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setClearColor(0x000000, 0);   // empty pixels stay alpha 0 -> darkest glyph
 document.body.appendChild(renderer.domElement);
 
-const target = new THREE.WebGLRenderTarget(1, 1);
+const target      = new THREE.WebGLRenderTarget(1, 1);
+const trailTarget = new THREE.WebGLRenderTarget(1, 1);
 
-// -- pass 1
+const fullscreenQuad = (material) => {
+  const s = new THREE.Scene();
+  s.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material));
+  return s;
+};
+const quadCamera = new THREE.Camera();
+
+// -- pass 1: scene
 const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
 camera.position.z = 5;
 
-const mesh = new THREE.Mesh(
-  new THREE.TorusKnotGeometry(1, 0.36, 220, 32),
-  new THREE.ShaderMaterial({
-    vertexShader: sceneVert,
-    fragmentShader: sceneFrag,
-    uniforms: {
-      uRemapColor:     { value: new THREE.Vector3(...CONFIG.remapColor) },
-      uLightDir:       { value: new THREE.Vector3(...CONFIG.lightDir) },
-      uBrightness:     { value: CONFIG.brightness },
-      uNormalStrength: { value: CONFIG.normalStrength },
-    },
-  })
-);
-scene.add(mesh);
+// One material for every mesh in the subject. dragonfly.xyz uses two instances
+// with different uRemapColor — one for the insect, one for the branch.
+const surfaceMaterial = new THREE.ShaderMaterial({
+  vertexShader: sceneVert,
+  fragmentShader: sceneFrag,
+  uniforms: {
+    uRemapColor:     { value: new THREE.Vector3(...CONFIG.remapColor) },
+    uLightDir:       { value: new THREE.Vector3(...CONFIG.lightDir) },
+    uBrightness:     { value: CONFIG.brightness },
+    uNormalStrength: { value: CONFIG.normalStrength },
+    uReveal:         { value: CONFIG.reveal },
+  },
+});
 
-// -- pass 2
-const quadScene  = new THREE.Scene();
-const quadCamera = new THREE.Camera();
+const subject = new THREE.Group();
+scene.add(subject);
+let mixer = null;
+
+// Centre on the origin and scale to a predictable size, so any .glb frames the
+// same way regardless of the units it was authored in.
+function fitToView(object) {
+  const box    = new THREE.Box3().setFromObject(object);
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+  if (!sphere.radius) return;
+  const scale = CONFIG.fitRadius / sphere.radius;
+  object.scale.multiplyScalar(scale);
+  object.position.sub(sphere.center.multiplyScalar(scale));
+}
+
+async function loadModel(url) {
+  const [{ GLTFLoader }, { DRACOLoader }] = await Promise.all([
+    import('three/addons/loaders/GLTFLoader.js'),
+    import('three/addons/loaders/DRACOLoader.js'),
+  ]);
+
+  const draco = new DRACOLoader().setDecoderPath(CONFIG.dracoPath);
+  const loader = new GLTFLoader().setDRACOLoader(draco);
+
+  try {
+    const gltf = await loader.loadAsync(url);
+
+    // Drop whatever materials the file shipped with.
+    gltf.scene.traverse((o) => { if (o.isMesh) o.material = surfaceMaterial; });
+
+    const holder = new THREE.Group();
+    holder.add(gltf.scene);
+    fitToView(holder);
+    subject.add(holder);
+
+    if (gltf.animations.length) {
+      mixer = new THREE.AnimationMixer(gltf.scene);
+      mixer.clipAction(gltf.animations[0]).play();
+    }
+    return gltf;
+  } finally {
+    draco.dispose();   // frees the decoder worker either way
+  }
+}
+
+function addPlaceholder() {
+  subject.add(new THREE.Mesh(new THREE.TorusKnotGeometry(1, 0.36, 220, 32), surfaceMaterial));
+}
+
+if (CONFIG.model) {
+  try {
+    await loadModel(CONFIG.model);
+  } catch (err) {
+    console.error(`could not load ${CONFIG.model}, falling back to the placeholder:`, err);
+    addPlaceholder();
+  }
+} else {
+  addPlaceholder();
+}
+
+// -- pass 2: trail
+const trailPoints   = Array.from({ length: TRAIL_LENGTH }, () => new THREE.Vector2(0.5, 0.5));
+const trailStrength = new Array(TRAIL_LENGTH).fill(0);
+
+const trailMaterial = new THREE.ShaderMaterial({
+  vertexShader: quadVert,
+  fragmentShader: trailFrag,
+  blending: THREE.NoBlending,
+  uniforms: {
+    uTrail:         { value: trailPoints },
+    uTrailStrength: { value: trailStrength },
+    uVelocity:      { value: 0 },
+  },
+});
+const trailScene = fullscreenQuad(trailMaterial);
+
+const mouseUV = new THREE.Vector2(0.5, 0.5);
+let lastMouseUV = new THREE.Vector2(0.5, 0.5);
+let velocity = 0;
+
+addEventListener('pointermove', (e) => {
+  mouseUV.set(e.clientX / innerWidth, 1 - e.clientY / innerHeight);
+  velocity = Math.min(1, velocity + mouseUV.distanceTo(lastMouseUV) * 12);
+  lastMouseUV.copy(mouseUV);
+});
+
+function updateTrail() {
+  velocity *= 0.94;
+  // chain: every point eases toward the one in front of it
+  for (let i = TRAIL_LENGTH - 1; i > 0; i--) {
+    trailPoints[i].lerp(trailPoints[i - 1], 0.499);
+    trailStrength[i] = THREE.MathUtils.lerp(trailStrength[i], trailStrength[i - 1] * 0.99, 0.499);
+  }
+  trailPoints[0].copy(mouseUV);
+  trailStrength[0] = Math.min(velocity * TRAIL_LENGTH, 1);
+  trailMaterial.uniforms.uVelocity.value = velocity;
+}
+
+// -- pass 3: ascii
 const asciiMaterial = new THREE.ShaderMaterial({
-  vertexShader: asciiVert,
+  vertexShader: quadVert,
   fragmentShader: asciiFrag,
   uniforms: {
     tDiffuse:           { value: target.texture },
+    tMouseTrail:        { value: trailTarget.texture },
     uCharactersTexture: { value: makeAtlas(CONFIG) },
     uResolution:        { value: new THREE.Vector2() },
     uGranularity:       { value: CONFIG.granularity },
     uCharactersLimit:   { value: CONFIG.charLimit },
     uColor:             { value: new THREE.Color(CONFIG.color) },
+    uAccentColor:       { value: new THREE.Color(CONFIG.accentColor) },
     uBackground:        { value: new THREE.Color(CONFIG.background) },
     uTime:              { value: 0 },
+    uSmear:             { value: CONFIG.smear },
+    uMatrixSpeed:       { value: CONFIG.matrixSpeed },
+    uOutProgress:       { value: CONFIG.outProgress },
     uNoise:             { value: CONFIG.noise },
+    uMatrix:            { value: CONFIG.matrix },
   },
 });
-quadScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), asciiMaterial));
+const asciiScene = fullscreenQuad(asciiMaterial);
 
 function resize() {
   const w = innerWidth, h = innerHeight, dpr = renderer.getPixelRatio();
   renderer.setSize(w, h);
-  target.setSize(w * dpr, h * dpr);
+  target.setSize(Math.round(w * dpr), Math.round(h * dpr));
+  trailTarget.setSize(Math.ceil(w * dpr / 4), Math.ceil(h * dpr / 4));   // trail runs at quarter res
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   asciiMaterial.uniforms.uResolution.value.set(w, h);
@@ -216,16 +534,71 @@ function resize() {
 addEventListener('resize', resize);
 resize();
 
-renderer.setAnimationLoop((t) => {
-  mesh.rotation.set(t * 0.0002, t * 0.0003, 0);
-  mesh.position.y = Math.sin(t * 0.0006) * 0.15;
+// -- transitions
+const tweens = [];
+function tween(uniform, to, duration) {
+  const running = tweens.findIndex((w) => w.uniform === uniform);
+  if (running >= 0) tweens.splice(running, 1);
+  tweens.push({ uniform, from: uniform.value, to, duration, elapsed: 0 });
+}
+function updateTweens(dt) {
+  if (!tweens.length) return;
+  for (let i = tweens.length - 1; i >= 0; i--) {
+    const w = tweens[i];
+    w.elapsed += dt;
+    const k = Math.min(1, w.elapsed / w.duration);
+    const ease = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+    w.uniform.value = w.from + (w.to - w.from) * ease;
+    if (k >= 1) tweens.splice(i, 1);
+  }
+  drawHud();
+}
+
+// -- controls
+const hud = document.getElementById('hud');
+const drawHud = () => {
+  const u = asciiMaterial.uniforms, m = surfaceMaterial.uniforms;
+  hud.textContent =
+    `[m] matrix ${u.uMatrix.value ? 'on ' : 'off'}   [n] grain ${u.uNoise.value ? 'on ' : 'off'}   `
+    + `[ / ] smear ${u.uSmear.value.toFixed(2)}\n`
+    + `[r] reveal ${m.uReveal.value.toFixed(2)}   [e] exit ${u.uOutProgress.value.toFixed(2)}   `
+    + `move the mouse for the trail`;
+};
+addEventListener('keydown', (e) => {
+  const u = asciiMaterial.uniforms, m = surfaceMaterial.uniforms;
+  if (e.key === 'm') u.uMatrix.value = !u.uMatrix.value;
+  if (e.key === 'n') u.uNoise.value  = !u.uNoise.value;
+  if (e.key === '[') u.uSmear.value = Math.max(0, u.uSmear.value - 0.05);
+  if (e.key === ']') u.uSmear.value = Math.min(1, u.uSmear.value + 0.05);
+  if (e.key === 'r') { m.uReveal.value = 1; tween(m.uReveal, 0, CONFIG.revealDuration); }
+  if (e.key === 'e') tween(u.uOutProgress, u.uOutProgress.value < 0.5 ? 1 : 0, CONFIG.exitDuration);
+  drawHud();
+});
+drawHud();
+tween(surfaceMaterial.uniforms.uReveal, 0, CONFIG.revealDuration);   // wipe in on load
+
+let prevTime = 0;
+renderer.setAnimationLoop((ms) => {
+  const t = ms * 0.001;
+  const dt = Math.min(0.05, t - prevTime);
+  prevTime = t;
+
+  subject.rotation.set(0, t * 0.3, 0);
+  subject.position.y = Math.sin(t * 0.6) * 0.15;
+  if (mixer) mixer.update(dt);
   asciiMaterial.uniforms.uTime.value = t;
+
+  updateTweens(dt);
+  updateTrail();
+  renderer.setRenderTarget(trailTarget);
+  renderer.clear();
+  renderer.render(trailScene, quadCamera);
 
   renderer.setRenderTarget(target);
   renderer.clear();
   renderer.render(scene, camera);
 
   renderer.setRenderTarget(null);
-  renderer.render(quadScene, quadCamera);
+  renderer.render(asciiScene, quadCamera);
 });
 </script>
