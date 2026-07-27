@@ -33,7 +33,7 @@ import * as THREE from 'three';
 const CONFIG = {
   characters: ' * _<>,  ./O#SF +',  // glyph ramp, darkest -> densest
   charLimit:  15,                   // how many of them the luminance ramp maps onto (site: 16)
-  granularity: 9,                   // cell size in CSS px
+  granularity: 4,                   // cell size in CSS px
   fontSize:   72,                   // px, drawn into a 64px atlas cell
   color:      '#eeeeee',            // glyph colour
   accentColor:'#ff8033',            // trail highlight (site theme-orange: 1.0, 0.5, 0.2)
@@ -93,18 +93,43 @@ const CONFIG = {
   //
   // The fox is a CC0 stand-in, only here so a fresh clone shows the loader
   // working. Swap in your own model and it will be framed the same way.
-  model:     'models/Fox.glb',
+  model:     'models/dragonfly.glb',
   dracoPath: 'libs/draco/',
-  // Model is scaled so its bounding sphere matches this. The camera sees
-  // 2 * 5 * tan(17.5deg) = 3.15 units of height, so a model that fills its
-  // bounding sphere vertically clips above about 1.57 — that was the avocado.
-  //
-  // An elongated model has a sphere dominated by its length and so leaves the
-  // frame mostly empty, and can be pushed much further. Measured on the fox by
-  // projecting its box corners over a full spin against both bob extremes:
-  // 1.85 puts the worst excursion at 0.93 of the frame, and 1.95 hits exactly
-  // 1.0. Raise this per model rather than trusting one number.
-  fitRadius: 1.85,
+  // The site's hero runs a long lens — fov 11 at z 5 — which flattens
+  // perspective so the subject reads evenly rather than falling away toward the
+  // edges. It also shrinks the frustum to 2 * 5 * tan(5.5deg) = 0.96 units of
+  // height, against 3.15 at fov 35, so fitRadius scales down with it.
+  fov: 11,
+
+  // Model is scaled so its bounding sphere matches this. There is no single
+  // right value — it depends on how much of its bounding sphere the model
+  // actually fills. Measure by projecting the box corners over a full spin
+  // rather than guessing.
+  fitRadius: 0.6,
+
+  // The camera sits still and looks down on the subject — nothing orbits, so
+  // the view stays fixed relative to the branch.
+  cameraDistance:  5,
+  cameraElevation: 30,      // degrees above the horizon
+
+  // Static yaw on the model. Only applies when the model camera below is off —
+  // with it on, the rig is inside the same group and rotates along with the
+  // model, so the rendered shot is unchanged. Negative is clockwise from above.
+  subjectYaw: -45,          // degrees
+
+  // dragonfly.glb ships its own animated camera rig, which is how the site
+  // frames its hero. When both nodes are present these drive the camera and
+  // everything above is ignored; any other model falls back to the manual
+  // placement. Note the rig scales with the model, so fitRadius stops mattering
+  // for framing — camera and subject scale together and the image is identical.
+  useModelCamera:   true,
+  cameraFollowNode: 'camera-follow',
+  cameraLookAtNode: 'camera-lookAt',
+
+  // The clip is scrubbed by the wheel rather than running on a clock. Damping
+  // eases the value toward wherever scrolling has left it.
+  scrollSensitivity: 0.0006,   // progress per wheel pixel
+  scrollDamping:     0.12,
 };
 
 const TRAIL_LENGTH = 40;
@@ -172,7 +197,13 @@ const sceneFrag = /* glsl */`
   varying vec3  vNormal;
 
   void main() {
+    // Wings and similar thin surfaces are single-sided, so their undersides are
+    // backfaces. We draw those (side: DoubleSide) and flip the normal here —
+    // without the flip an underside shades as though lit from behind and loses
+    // its edge against the background.
     vec3 normal = normalize(vNormal);
+    if (!gl_FrontFacing) normal = -normal;
+
     float diff  = max(dot(normal, normalize(uLightDir)), 0.0);
 
     vec3 color = (diff * uBrightness) + normal * uNormalStrength + 0.5;
@@ -462,8 +493,14 @@ const quadCamera = new THREE.Camera();
 
 // -- pass 1: scene
 const scene  = new THREE.Scene();
-const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
-camera.position.z = 5;
+const camera = new THREE.PerspectiveCamera(CONFIG.fov, 1, 0.1, 100);
+{
+  const elev = THREE.MathUtils.degToRad(CONFIG.cameraElevation);
+  camera.position.set(0,
+                      Math.sin(elev) * CONFIG.cameraDistance,
+                      Math.cos(elev) * CONFIG.cameraDistance);
+  camera.lookAt(0, 0, 0);
+}
 
 // One material per CONFIG.surfaces entry. uReveal is a single uniform object
 // shared by all of them, so the wipe stays in lockstep off one tween instead of
@@ -481,6 +518,9 @@ const materials = Object.fromEntries(
       uNormalStrength: { value: spec.normalStrength },
       uReveal:         revealUniform,
     },
+    // Thin geometry has no back — cull it and the undersides vanish. On this
+    // model that was hiding 45-100% of the drawn pixels depending on the angle.
+    side: THREE.DoubleSide,
   })])
 );
 
@@ -497,8 +537,10 @@ function surfaceFor(object) {
 }
 
 const subject = new THREE.Group();
+subject.rotation.y = THREE.MathUtils.degToRad(CONFIG.subjectYaw);
 scene.add(subject);
-let mixer = null;
+let mixer = null, clipDuration = 0, cameraRig = null;
+const _rigTarget = new THREE.Vector3();
 
 // Centre on the origin and scale to a predictable size, so any .glb frames the
 // same way regardless of the units it was authored in.
@@ -555,6 +597,13 @@ async function loadModel(url) {
     if (gltf.animations.length) {
       mixer = new THREE.AnimationMixer(gltf.scene);
       mixer.clipAction(gltf.animations[0]).play();
+      clipDuration = gltf.animations[0].duration;
+    }
+
+    if (CONFIG.useModelCamera) {
+      const follow = gltf.scene.getObjectByName(CONFIG.cameraFollowNode);
+      const lookAt = gltf.scene.getObjectByName(CONFIG.cameraLookAtNode);
+      if (follow && lookAt) cameraRig = { follow, lookAt };
     }
     return gltf;
   } finally {
@@ -672,6 +721,13 @@ function updateTweens(dt) {
   drawHud();
 }
 
+// -- scroll drives the clip
+let scrollTarget = 0, scrollValue = 0;
+addEventListener('wheel', (e) => {
+  scrollTarget = Math.min(1, Math.max(0, scrollTarget + e.deltaY * CONFIG.scrollSensitivity));
+  drawHud();
+}, { passive: true });
+
 // -- controls
 const hud = document.getElementById('hud');
 const drawHud = () => {
@@ -680,7 +736,7 @@ const drawHud = () => {
     `[m] matrix ${u.uMatrix.value ? 'on ' : 'off'}   [n] grain ${u.uNoise.value ? 'on ' : 'off'}   `
     + `[ / ] smear ${u.uSmear.value.toFixed(2)}\n`
     + `[r] reveal ${revealUniform.value.toFixed(2)}   [e] exit ${u.uOutProgress.value.toFixed(2)}   `
-    + `move the mouse for the trail`;
+    + `scroll ${(scrollValue * 100).toFixed(0)}%   move the mouse for the trail`;
 };
 // The entrance: the scene pass uncovers the surface by normal while the ASCII
 // pass drops the columns back down. Two passes, one gesture.
@@ -714,10 +770,17 @@ renderer.setAnimationLoop((ms) => {
   const dt = Math.min(0.05, t - prevTime);
   prevTime = t;
 
-  subject.rotation.set(0, t * 0.3, 0);
-  subject.position.y = Math.sin(t * 0.6) * 0.15;
-  if (mixer) mixer.update(dt);
+  scrollValue += (scrollTarget - scrollValue) * CONFIG.scrollDamping;
+  if (mixer) mixer.setTime(scrollValue * clipDuration);
   asciiMaterial.uniforms.uTime.value = t;
+
+  // The rig lives inside the subject, so its world matrices are only current
+  // once the scrubbed pose has been flushed down the graph.
+  if (cameraRig) {
+    subject.updateMatrixWorld(true);
+    camera.position.setFromMatrixPosition(cameraRig.follow.matrixWorld);
+    camera.lookAt(_rigTarget.setFromMatrixPosition(cameraRig.lookAt.matrixWorld));
+  }
 
   updateTweens(dt);
   updateTrail();
