@@ -81,10 +81,15 @@ const CONFIG = {
   revealLift:         0.6,
   revealLiftDuration: 1.0,
 
-  // Point this at a .glb to replace the placeholder torus knot. Draco-compressed
-  // files work as-is; the decoder is vendored in libs/draco/. Any materials and
-  // textures in the file are discarded — the surface shader below replaces them.
-  model:     null,
+  // Point this at a .glb or .gltf to replace the placeholder torus knot.
+  // Draco-compressed files work as-is; the decoder is vendored in libs/draco/.
+  // Any materials and textures in the file are discarded — the surface shader
+  // below replaces them, so stripping the texture graph before shipping a model
+  // saves the loader fetching PNGs it will throw away.
+  //
+  // The avocado is a CC0 stand-in, only here so a fresh clone shows the loader
+  // working. Swap in your own model and it will be framed the same way.
+  model:     'models/avocado.gltf',
   dracoPath: 'libs/draco/',
   fitRadius: 1.6,       // model is scaled so its bounding sphere matches this
 };
