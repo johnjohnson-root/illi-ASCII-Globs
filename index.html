@@ -100,36 +100,61 @@ const CONFIG = {
   //
   // The fox is a CC0 stand-in, only here so a fresh clone shows the loader
   // working. Swap in your own model and it will be framed the same way.
-  model:     'models/dragonfly.glb',
+  model:     'models/Fox.glb',
   dracoPath: 'libs/draco/',
   // The site's hero runs a long lens — fov 11 at z 5 — which flattens
   // perspective so the subject reads evenly rather than falling away toward the
   // edges. It also shrinks the frustum to 2 * 5 * tan(5.5deg) = 0.96 units of
   // height, against 3.15 at fov 35, so fitRadius scales down with it.
-  fov: 11,
+  fov: 35,
 
   // Model is scaled so its bounding sphere matches this. There is no single
   // right value — it depends on how much of its bounding sphere the model
   // actually fills. Measure by projecting the box corners over a full spin
   // rather than guessing.
-  fitRadius: 0.6,
+  fitRadius: 1.85,
 
   // The camera sits still and looks down on the subject — nothing orbits, so
   // the view stays fixed relative to the branch.
   cameraDistance:  5,
-  cameraElevation: 30,      // degrees above the horizon
+  cameraElevation: 0,       // degrees above the horizon
+
+  // The subject turns under a still camera, as it did originally.
+  idleSpin: 0.3,            // radians per second about +Y
+  idleBob:  0.15,           // world units, peak of the vertical drift
 
   // Static yaw on the model. Only applies when the model camera below is off —
   // with it on, the rig is inside the same group and rotates along with the
   // model, so the rendered shot is unchanged. Negative is clockwise from above.
-  subjectYaw: -45,          // degrees
+  subjectYaw: 0,            // degrees
 
-  // dragonfly.glb ships its own animated camera rig, which is how the site
-  // frames its hero. When both nodes are present these drive the camera and
-  // everything above is ignored; any other model falls back to the manual
-  // placement. Note the rig scales with the model, so fitRadius stops mattering
-  // for framing — camera and subject scale together and the image is identical.
-  useModelCamera:   true,
+  // Camera path keyed to scroll progress. The camera always aims at the model,
+  // so any model stays framed regardless of shape — this is the universal path,
+  // as against the rig baked into dragonfly.glb. `pitchBias` tilts down from
+  // that aim: 0 centres the model, positive pushes it up the frame.
+  //
+  // Absolute pitch angles cannot be specified alongside positions — the two
+  // over-determine the aim, and a position vector's direction to the model is
+  // fixed no matter how far out you push it.
+  useCameraPath: false,
+  cameraPath: [
+    { at: 0.00, pos: [ 0.00, 0.70, 0.20], pitchBias: 0 },
+    { at: 0.15, pos: [ 0.00, 1.10, 0.40], pitchBias: 0 },
+    { at: 0.35, pos: [-0.15, 1.70, 0.80], pitchBias: 0 },
+    { at: 0.70, pos: [ 0.30, 2.80, 1.10], pitchBias: 0 },
+  ],
+
+  // Past the last keyframe the camera orbits instead of travelling: it holds
+  // that keyframe's height and radius and turns counterclockwise seen from
+  // above, easing the bias to its final value by 100%.
+  orbitSweep:        90,      // degrees swept from the last keyframe to 100%
+  orbitEndPitchBias: 0,
+
+  // dragonfly.glb also ships its own animated rig ('camera-follow' /
+  // 'camera-lookAt'), which is how the site frames its hero. Turn this on to
+  // use it instead — but it is authored for that one model and means nothing
+  // for anything else.
+  useModelCamera:   false,
   cameraFollowNode: 'camera-follow',
   cameraLookAtNode: 'camera-lookAt',
 
@@ -771,22 +796,64 @@ addEventListener('keydown', (e) => {
 drawHud();
 playReveal();   // on load
 
+// Position the camera for a point on the scroll. Between keyframes it eases on
+// position and pitch; past the last one it orbits at fixed height and radius.
+const _camPos = new THREE.Vector3();
+const ease = (k) => k * k * (3.0 - 2.0 * k);
+
+function placeCamera(progress) {
+  const path = CONFIG.cameraPath;
+  const last = path[path.length - 1];
+  let bias;
+
+  if (progress <= last.at) {
+    let i = 0;
+    while (i < path.length - 2 && progress > path[i + 1].at) i++;
+    const a = path[i], b = path[i + 1];
+    const k = ease(b.at === a.at ? 0 : (progress - a.at) / (b.at - a.at));
+    _camPos.set(a.pos[0] + (b.pos[0] - a.pos[0]) * k,
+                a.pos[1] + (b.pos[1] - a.pos[1]) * k,
+                a.pos[2] + (b.pos[2] - a.pos[2]) * k);
+    bias = a.pitchBias + (b.pitchBias - a.pitchBias) * k;
+  } else {
+    // x = r*sin(phi), z = r*cos(phi): increasing phi runs +Z toward +X, which
+    // reads counterclockwise looking down the +Y axis.
+    const radius = Math.hypot(last.pos[0], last.pos[2]);
+    const phi0   = Math.atan2(last.pos[0], last.pos[2]);
+    const k      = ease(Math.min(1, (progress - last.at) / (1 - last.at)));
+    const phi    = phi0 + THREE.MathUtils.degToRad(CONFIG.orbitSweep) * k;
+    _camPos.set(radius * Math.sin(phi), last.pos[1], radius * Math.cos(phi));
+    bias = last.pitchBias + (CONFIG.orbitEndPitchBias - last.pitchBias) * k;
+  }
+
+  // fitToView centres the model on the origin, so that is what we aim at.
+  camera.position.copy(_camPos);
+  camera.lookAt(0, 0, 0);
+  // Local +X rotation tilts the -Z forward axis toward +Y, so negate to drop.
+  if (bias) camera.rotateX(-THREE.MathUtils.degToRad(bias));
+}
+
 let prevTime = 0;
 renderer.setAnimationLoop((ms) => {
   const t = ms * 0.001;
   const dt = Math.min(0.05, t - prevTime);
   prevTime = t;
 
+  subject.rotation.set(0, THREE.MathUtils.degToRad(CONFIG.subjectYaw) + t * CONFIG.idleSpin, 0);
+  subject.position.y = Math.sin(t * 0.6) * CONFIG.idleBob;
+
   scrollValue += (scrollTarget - scrollValue) * CONFIG.scrollDamping;
   if (mixer) mixer.setTime(scrollValue * clipDuration);
   asciiMaterial.uniforms.uTime.value = t;
 
-  // The rig lives inside the subject, so its world matrices are only current
-  // once the scrubbed pose has been flushed down the graph.
   if (cameraRig) {
+    // The rig lives inside the subject, so its world matrices are only current
+    // once the scrubbed pose has been flushed down the graph.
     subject.updateMatrixWorld(true);
     camera.position.setFromMatrixPosition(cameraRig.follow.matrixWorld);
     camera.lookAt(_rigTarget.setFromMatrixPosition(cameraRig.lookAt.matrixWorld));
+  } else if (CONFIG.useCameraPath) {
+    placeCamera(scrollValue);
   }
 
   updateTweens(dt);
