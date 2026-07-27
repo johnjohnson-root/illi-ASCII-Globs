@@ -56,13 +56,16 @@ change `characters` and the atlas regenerates.
 | Control | |
 |---|---|
 | upload / URL | swap the model |
-| spin | continuous rotation on or off |
+| spin | continuous rotation on or off; with it off, drag the model to turn it |
 | scroll | what the wheel drives — see below |
 | cell | glyph size in pixels; smaller reads as stipple, larger as text |
 | ramp | how many characters the luminance maps onto |
 | size | how large the model sits in frame |
 | tone | overall brightness, which shifts where the ramp lands |
 | copy config | current settings as a pasteable `CONFIG` block |
+
+Drag rotates on both axes, with pitch clamped short of vertical. The orientation
+you leave it at survives toggling spin back on.
 
 Keys: `m` matrix, `n` grain, `[` `]` smear, `r` replay entrance, `e` dissolve.
 

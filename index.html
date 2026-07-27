@@ -5,6 +5,8 @@
 <style>
   html, body { margin: 0; height: 100%; background: #0a0a0a; overflow: hidden; }
   canvas { display: block; }
+  canvas.grab    { cursor: grab; }
+  canvas.grabbing { cursor: grabbing; }
   .panel {
     background: rgba(10, 10, 10, 0.35);
     backdrop-filter: blur(6px);
@@ -141,6 +143,10 @@ const CONFIG = {
   spin:     true,           // toggle in the panel
   idleSpin: 0.3,            // radians per second about +Y
   idleBob:  0.15,           // world units, peak of the vertical drift
+
+  // With spin off, drag to turn the model by hand.
+  dragSensitivity: 0.008,   // radians per pixel
+  dragPitchLimit:  80,      // degrees, to stop it tipping past vertical
 
   // What the wheel drives. 'clip' scrubs the model's own animation and does
   // nothing on a model without one; the rest work on anything.
@@ -677,7 +683,36 @@ const mouseUV = new THREE.Vector2(0.5, 0.5);
 let lastMouseUV = new THREE.Vector2(0.5, 0.5);
 let velocity = 0;
 
+let dragging = false, dragLastX = 0, dragLastY = 0, dragYaw = 0, dragPitch = 0;
+const canvas = renderer.domElement;
+
+const setGrabCursor = () => {
+  canvas.classList.toggle('grab', !CONFIG.spin && !dragging);
+  canvas.classList.toggle('grabbing', !CONFIG.spin && dragging);
+};
+
+canvas.addEventListener('pointerdown', (e) => {
+  if (CONFIG.spin) return;
+  dragging = true;
+  dragLastX = e.clientX; dragLastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+  setGrabCursor();
+});
+
+canvas.addEventListener('pointerup', (e) => {
+  dragging = false;
+  canvas.releasePointerCapture?.(e.pointerId);
+  setGrabCursor();
+});
+
 addEventListener('pointermove', (e) => {
+  if (dragging) {
+    const limit = THREE.MathUtils.degToRad(CONFIG.dragPitchLimit);
+    dragYaw   += (e.clientX - dragLastX) * CONFIG.dragSensitivity;
+    dragPitch += (e.clientY - dragLastY) * CONFIG.dragSensitivity;
+    dragPitch = Math.max(-limit, Math.min(limit, dragPitch));
+    dragLastX = e.clientX; dragLastY = e.clientY;
+  }
   mouseUV.set(e.clientX / innerWidth, 1 - e.clientY / innerHeight);
   velocity = Math.min(1, velocity + mouseUV.distanceTo(lastMouseUV) * 12);
   lastMouseUV.copy(mouseUV);
@@ -767,7 +802,8 @@ const drawHud = () => {
     `[m] matrix ${u.uMatrix.value ? 'on ' : 'off'}   [n] grain ${u.uNoise.value ? 'on ' : 'off'}   `
     + `[ / ] smear ${u.uSmear.value.toFixed(2)}\n`
     + `[r] reveal ${revealUniform.value.toFixed(2)}   [e] exit ${u.uOutProgress.value.toFixed(2)}   `
-    + `scroll ${(scrollValue * 100).toFixed(0)}%   move the mouse for the trail`;
+    + `scroll ${(scrollValue * 100).toFixed(0)}%   `
+    + (CONFIG.spin ? 'move the mouse for the trail' : 'drag to rotate');
 };
 // The entrance: the scene pass uncovers the surface while the ASCII pass
 // drops the columns back down. Two passes, one gesture.
@@ -802,7 +838,7 @@ $('url').onkeydown = (e) => {
 };
 
 $('spin').checked = CONFIG.spin;
-$('spin').onchange = (e) => { CONFIG.spin = e.target.checked; };
+$('spin').onchange = (e) => { CONFIG.spin = e.target.checked; setGrabCursor(); drawHud(); };
 
 $('effect').value = CONFIG.scrollEffect;
 $('effect').onchange = (e) => {
@@ -882,6 +918,7 @@ addEventListener('keydown', (e) => {
   drawHud();
 });
 drawHud();
+setGrabCursor();
 playReveal();   // on load
 
 // Only one effect runs at a time; switching resets whatever the last one drove.
@@ -952,8 +989,9 @@ renderer.setAnimationLoop((ms) => {
   const dt = Math.min(0.05, t - prevTime);
   prevTime = t;
 
-  const yaw = THREE.MathUtils.degToRad(CONFIG.subjectYaw);
-  subject.rotation.set(0, CONFIG.spin ? yaw + t * CONFIG.idleSpin : yaw, 0);
+  const yaw = THREE.MathUtils.degToRad(CONFIG.subjectYaw) + dragYaw
+            + (CONFIG.spin ? t * CONFIG.idleSpin : 0);
+  subject.rotation.set(CONFIG.spin ? 0 : dragPitch, yaw, 0);
   subject.position.y = CONFIG.spin ? Math.sin(t * 0.6) * CONFIG.idleBob : 0;
 
   scrollValue += (scrollTarget - scrollValue) * CONFIG.scrollDamping;
