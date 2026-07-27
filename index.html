@@ -109,10 +109,6 @@ const CONFIG = {
 
 const TRAIL_LENGTH = 40;
 
-// Which slots in the ramp are blank, packed one per bit for the shader.
-const blankMask = CONFIG.characters.split('').reduce(
-  (mask, ch, i) => (i < 24 && ch.trim() === '' ? mask + Math.pow(2, i) : mask), 0);
-
 // ---------------------------------------------------------------------------
 // 1. GLYPH ATLAS — generated at runtime, no image asset.
 //    1024x1024 canvas, 16x16 grid of 64px cells, one character per cell.
@@ -276,7 +272,6 @@ const asciiFrag = /* glsl */`
   uniform float uSmear;
   uniform float uMatrixSpeed;
   uniform float uOutProgress;
-  uniform float uBlankMask;
   uniform bool  uNoise;
   uniform bool  uMatrix;
 
@@ -313,13 +308,6 @@ const asciiFrag = /* glsl */`
     charUV   += vec2(charX, -charY) / GRID;
 
     return texture2D(uCharactersTexture, charUV).r;
-  }
-
-  // Bit i of uBlankMask is set when characters[i] is whitespace. A bitmask
-  // rather than a uniform array because GLSL ES 1.00 will not let us index an
-  // array with a value computed at runtime.
-  bool glyphIsBlank(float index) {
-    return mod(floor(uBlankMask / exp2(index)), 2.0) > 0.5;
   }
 
   float grayscale(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
@@ -430,12 +418,7 @@ const asciiFrag = /* glsl */`
     float i0 = floor(f);
     float i1 = min(i0 + 1.0, uCharactersLimit - 1.0);
 
-    // The ramp's blanks are deliberate holes. Fading into or out of one fills
-    // them in and costs the field its airiness, so those pairs snap as before.
-    float blend = fract(f);
-    if (glyphIsBlank(i0) || glyphIsBlank(i1)) blend = 0.0;
-
-    float ascii = mix(glyph(i0, screenUV, division), glyph(i1, screenUV, division), blend);
+    float ascii = mix(glyph(i0, screenUV, division), glyph(i1, screenUV, division), fract(f));
 
     // --- grain ---
     if (uNoise) {
@@ -651,7 +634,6 @@ const asciiMaterial = new THREE.ShaderMaterial({
     uSmear:             { value: CONFIG.smear },
     uMatrixSpeed:       { value: CONFIG.matrixSpeed },
     uOutProgress:       { value: CONFIG.outProgress },
-    uBlankMask:         { value: blankMask },
     uNoise:             { value: CONFIG.noise },
     uMatrix:            { value: CONFIG.matrix },
   },
