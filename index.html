@@ -1,25 +1,69 @@
 <!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ASCII post-process — minimal</title>
+<title>ASCII Globs — render any .glb as ASCII</title>
 <style>
   html, body { margin: 0; height: 100%; background: #0a0a0a; overflow: hidden; }
   canvas { display: block; }
-  #hud {
-    position: fixed; left: 12px; bottom: 12px; z-index: 1;
-    font: 12px/1.6 ui-monospace, monospace; color: #666; white-space: pre;
-    pointer-events: none; user-select: none;
-    /* Light fill; the blur is what makes the text readable over stipple.
-       Same approach the site uses on its own nav panel. */
+  .panel {
     background: rgba(10, 10, 10, 0.35);
     backdrop-filter: blur(6px);
     -webkit-backdrop-filter: blur(6px);
     padding: 6px 10px;
     border-radius: 2px;
   }
+  #controls {
+    position: fixed; right: 12px; top: 12px; z-index: 2; width: 232px;
+    font: 12px/1.7 ui-monospace, monospace; color: #999;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  #controls label { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
+  #controls input[type=range] { flex: 1; min-width: 0; accent-color: #ff8033; }
+  #controls input[type=text], #controls select, #controls button {
+    font: inherit; color: #ccc; background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 2px; padding: 3px 5px;
+  }
+  #controls button { cursor: pointer; }
+  #controls button:hover { background: rgba(255,255,255,0.12); }
+  #controls hr { border: 0; border-top: 1px solid rgba(255,255,255,0.1); margin: 2px 0; width: 100%; }
+  #controls .row { display: flex; gap: 6px; }
+  #controls .row > * { flex: 1; min-width: 0; }
+  #status { color: #ff8033; min-height: 1.7em; overflow-wrap: anywhere; }
+  #hud {
+    position: fixed; left: 12px; bottom: 12px; z-index: 1;
+    font: 12px/1.6 ui-monospace, monospace; color: #666; white-space: pre;
+    pointer-events: none; user-select: none;
+  }
 </style>
 
-<div id="hud"></div>
+<div id="hud" class="panel"></div>
+
+<div id="controls" class="panel">
+  <div class="row">
+    <button id="pick">upload .glb</button>
+    <button id="copy">copy config</button>
+  </div>
+  <input type="text" id="url" placeholder="…or paste a .glb / .gltf URL" spellcheck="false">
+  <input type="file" id="file" accept=".glb,.gltf" hidden>
+  <div id="status"></div>
+  <hr>
+  <label>spin <input type="checkbox" id="spin"></label>
+  <label>scroll
+    <select id="effect">
+      <option value="clip">animation</option>
+      <option value="orbit">orbit</option>
+      <option value="dolly">dolly</option>
+      <option value="smear">smear</option>
+      <option value="exit">dissolve</option>
+      <option value="none">nothing</option>
+    </select>
+  </label>
+  <hr>
+  <label>cell <input type="range" id="gran"  min="2"   max="24"  step="1"></label>
+  <label>ramp <input type="range" id="limit" min="2"   max="16"  step="1"></label>
+  <label>size <input type="range" id="fit"   min="0.4" max="3.5" step="0.05"></label>
+  <label>tone <input type="range" id="remap" min="0.2" max="1.5" step="0.05"></label>
+</div>
 
 <script type="importmap">
 {
@@ -33,10 +77,7 @@
 <script type="module">
 import * as THREE from 'three';
 
-// ---------------------------------------------------------------------------
-// CONFIG — the whole look lives here.
-// Values in comments are what dragonfly.xyz uses for its hero scene.
-// ---------------------------------------------------------------------------
+// Everything adjustable lives here.
 const CONFIG = {
   characters: ' * _<>,  ./O#SF +',  // glyph ramp, darkest -> densest
   charLimit:  15,                   // how many of them the luminance ramp maps onto (site: 16)
@@ -47,31 +88,22 @@ const CONFIG = {
   background: '#0a0a0a',
   brightnessFloor: 0.005,           // on-model cells never render darker than this (linear)
 
-  // Model shading, one entry per surface. `match` is tested against the mesh's
-  // own name and every ancestor's, so naming a group in Blender is enough to
-  // shade its whole subtree. First match wins; `default` catches the rest.
-  //
-  // The site splits its hero the same way: the insect gets a flat grey remap
-  // and hard light, the perch a cooler tint and much softer normals, picked
-  // apart with getObjectByName('Branch002'). Note glTF node names are
-  // sanitised on load — Blender's 'Branch.002' arrives as 'Branch002'.
+  // One entry per surface. `match` is tested against the mesh's own name and every
+  // ancestor's, so naming a group in Blender shades its whole subtree.
+  // First match wins; `default` catches the rest.
   surfaces: {
     branch: {
       match:          /^branch/i,
-      remapColor:     [0.69, 0.90, 0.90],   // site's exact perch values
+      remapColor:     [0.69, 0.90, 0.90],
       lightDir:       [0.0, 2.0, 1.0],
       brightness:     0.2,
       normalStrength: 0.5,
     },
     default: {
-      remapColor:     [0.85, 0.85, 0.85],   // site: [0.35, 0.35, 0.35] — much sparser glyphs
+      remapColor:     [0.85, 0.85, 0.85],
       lightDir:       [0.0, 0.8, 1.0],
       brightness:     0.5,
-      // Lowering this shifts weight off the raw normal and onto the smooth
-      // lambert term, so low-poly facets read less sharply. 1.05 measured 2.22%
-      // facet edges against 2.77% at the site's 1.5 — 20% fewer — and costs no
-      // tonal range (luminance span stays 184 across 185 distinct levels).
-      normalStrength: 1.05,
+      normalStrength: 1.05,   // lower reads smoother on low-poly models
     },
   },
 
@@ -85,57 +117,44 @@ const CONFIG = {
   revealDuration: 1.4,  // seconds
   exitDuration:   0.9,
 
-  // The reveal transition also runs the exit lift backwards, so columns fall
-  // into place while the normal wipe uncovers the surface. Set revealLift to 0
-  // for a bare wipe. The lift settles first — ending on the wipe rather than on
-  // sliding geometry keeps the last beat still.
+  // The entrance runs the dissolve backwards as the wipe uncovers the surface.
+  // The lift settles first, so the last beat is the wipe rather than sliding geometry.
   revealLift:         0.6,
   revealLiftDuration: 1.0,
 
-  // Point this at a .glb or .gltf to replace the placeholder torus knot.
-  // Draco-compressed files work as-is; the decoder is vendored in libs/draco/.
-  // Any materials and textures in the file are discarded — the surface shader
-  // below replaces them, so stripping the texture graph before shipping a model
-  // saves the loader fetching PNGs it will throw away.
-  //
-  // The fox is a CC0 stand-in, only here so a fresh clone shows the loader
-  // working. Swap in your own model and it will be framed the same way.
+  // Any .glb or .gltf. Draco files work as-is — the decoder is vendored in libs/draco/.
+  // Materials and textures in the file are discarded; the surface shader replaces them.
   model:     'models/Fox.glb',
   dracoPath: 'libs/draco/',
-  // The site's hero runs a long lens — fov 11 at z 5 — which flattens
-  // perspective so the subject reads evenly rather than falling away toward the
-  // edges. It also shrinks the frustum to 2 * 5 * tan(5.5deg) = 0.96 units of
-  // height, against 3.15 at fov 35, so fitRadius scales down with it.
+  // A long lens flattens perspective but shrinks the frustum,
+  // so fitRadius has to come down with fov.
   fov: 35,
 
-  // Model is scaled so its bounding sphere matches this. There is no single
-  // right value — it depends on how much of its bounding sphere the model
-  // actually fills. Measure by projecting the box corners over a full spin
-  // rather than guessing.
+  // The model is scaled so its bounding sphere matches this.
+  // How much of that sphere it actually fills varies wildly by shape.
   fitRadius: 1.85,
 
-  // The camera sits still and looks down on the subject — nothing orbits, so
-  // the view stays fixed relative to the branch.
   cameraDistance:  5,
   cameraElevation: 0,       // degrees above the horizon
 
   // The subject turns under a still camera, as it did originally.
+  spin:     true,           // toggle in the panel
   idleSpin: 0.3,            // radians per second about +Y
   idleBob:  0.15,           // world units, peak of the vertical drift
 
-  // Static yaw on the model. Only applies when the model camera below is off —
-  // with it on, the rig is inside the same group and rotates along with the
-  // model, so the rendered shot is unchanged. Negative is clockwise from above.
-  subjectYaw: 0,            // degrees
+  // What the wheel drives. 'clip' scrubs the model's own animation and does
+  // nothing on a model without one; the rest work on anything.
+  //   clip   scrub the glTF animation      orbit  circle the camera
+  //   dolly  pull the camera back          smear  melt rows downward
+  //   exit   lift columns off the top      none   ignore the wheel
+  scrollEffect: 'clip',
+  orbitTurns:   1,          // full revolutions across a complete scroll
+  dollyRange:   2.5,        // camera distance multiplier at 100%
 
-  // Camera path keyed to scroll progress. The camera always aims at the model,
-  // so any model stays framed regardless of shape — this is the universal path,
-  // as against the rig baked into dragonfly.glb. `pitchBias` tilts down from
-  // that aim: 0 centres the model, positive pushes it up the frame.
-  //
-  // Absolute pitch angles cannot be specified alongside positions — the two
-  // over-determine the aim, and a position vector's direction to the model is
-  // fixed no matter how far out you push it.
+  subjectYaw: 0,            // degrees, negative is clockwise from above
+
+  // An optional keyframed path. The camera always aims at the model,
+  // and `pitchBias` tilts down from that aim — 0 centres it.
   useCameraPath: false,
   cameraPath: [
     { at: 0.00, pos: [ 0.00, 0.70, 0.20], pitchBias: 0 },
@@ -144,16 +163,12 @@ const CONFIG = {
     { at: 0.70, pos: [ 0.30, 2.80, 1.10], pitchBias: 0 },
   ],
 
-  // Past the last keyframe the camera orbits instead of travelling: it holds
-  // that keyframe's height and radius and turns counterclockwise seen from
-  // above, easing the bias to its final value by 100%.
-  orbitSweep:        90,      // degrees swept from the last keyframe to 100%
+  // Past the last keyframe the camera holds that height and radius
+  // and orbits counterclockwise instead of travelling.
+  orbitSweep:        90,
   orbitEndPitchBias: 0,
 
-  // dragonfly.glb also ships its own animated rig ('camera-follow' /
-  // 'camera-lookAt'), which is how the site frames its hero. Turn this on to
-  // use it instead — but it is authored for that one model and means nothing
-  // for anything else.
+  // Some models ship their own animated camera rig. Turn this on to use it.
   useModelCamera:   false,
   cameraFollowNode: 'camera-follow',
   cameraLookAtNode: 'camera-lookAt',
@@ -166,10 +181,8 @@ const CONFIG = {
 
 const TRAIL_LENGTH = 40;
 
-// ---------------------------------------------------------------------------
-// 1. GLYPH ATLAS — generated at runtime, no image asset.
-//    1024x1024 canvas, 16x16 grid of 64px cells, one character per cell.
-// ---------------------------------------------------------------------------
+// Glyph atlas, drawn at runtime rather than shipped as an image:
+// a 1024px canvas, 16x16 grid, one character per cell.
 function makeAtlas({ characters, fontSize }) {
   const SIZE = 1024, GRID = 16, CELL = SIZE / GRID;
   const canvas = document.createElement('canvas');
@@ -188,18 +201,13 @@ function makeAtlas({ characters, fontSize }) {
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.minFilter = texture.magFilter = THREE.NearestFilter;
-  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;  // charUV goes negative; repeat wraps it
+  texture.wrapS = texture.wrapT = THREE.RepeatWrapping;   // charUV goes negative
   return texture;
 }
 
-// ---------------------------------------------------------------------------
-// 2. SCENE PASS — mesh shaded from its normals only. No lights, no textures,
-//    no materials on the model itself. Renders into an offscreen target.
-// ---------------------------------------------------------------------------
-// The three.js chunks are what make this work on rigged models: without the
-// skinning includes a SkinnedMesh renders in bind pose and the animation is
-// silently ignored. three enables USE_SKINNING per-object, so the same material
-// serves both skinned and static meshes.
+// Scene pass: shaded from normals alone, no lights or textures, into an offscreen target.
+// The skinning chunks matter — without them a rigged model renders in bind pose
+// and its animation is silently ignored.
 const sceneVert = /* glsl */`
   #include <common>
   #include <skinning_pars_vertex>
@@ -229,10 +237,8 @@ const sceneFrag = /* glsl */`
   varying vec3  vNormal;
 
   void main() {
-    // Wings and similar thin surfaces are single-sided, so their undersides are
-    // backfaces. We draw those (side: DoubleSide) and flip the normal here —
-    // without the flip an underside shades as though lit from behind and loses
-    // its edge against the background.
+    // Thin surfaces are single-sided, so their undersides are backfaces.
+    // We draw those, and flip the normal so they don't shade as if lit from behind.
     vec3 normal = normalize(vNormal);
     if (!gl_FrontFacing) normal = -normal;
 
@@ -242,8 +248,7 @@ const sceneFrag = /* glsl */`
     color = clamp(color, 0.15, 0.995);
     color *= uRemapColor;
 
-    // --- normal-based reveal wipe ---
-    // Y-facing surfaces appear first; a thin band rides the wipe front.
+    // Reveal wipe: upward-facing surfaces appear first, with a band on the front.
     float edge       = 0.05;
     float revealMask = dot(normal, vec3(0.0, 1.0, 0.0)) * 0.5 + 0.5;
 
@@ -251,27 +256,22 @@ const sceneFrag = /* glsl */`
     float edgeBand = smoothstep(uReveal - edge, uReveal, revealMask)
                    - smoothstep(uReveal, uReveal + edge, revealMask);
 
-    // At uReveal = 0 there is no wipe front, but the band still latches onto
-    // fully down-facing normals. Fade it out over the last of the wipe.
+    // Without this the band latches onto down-facing normals once the wipe is done.
     edgeBand *= smoothstep(0.0, edge, uReveal);
 
-    // Not in the original: stops hidden fragments writing depth and punching
-    // holes through geometry behind them. Visually identical either way.
+    // Discarding stops hidden fragments writing depth through geometry behind them.
     if (visible < 0.5) discard;
 
-    // rgb only ever survives as luminance, so the band is smuggled out through
-    // alpha for the ASCII pass to tint. Alpha now means: 0 = nothing drawn here,
-    // 0.5 = plain surface, 1.0 = full edge band.
+    // rgb survives only as luminance, so the band rides out in alpha for the ASCII
+    // pass to tint: 0 nothing drawn, 0.5 plain surface, 1.0 full band.
     color = mix(color, vec3(0.5, 0.8, 0.2), edgeBand);
 
     gl_FragColor = vec4(color, 0.5 + 0.5 * clamp(edgeBand, 0.0, 1.0));
   }
 `;
 
-// ---------------------------------------------------------------------------
-// 3. MOUSE TRAIL PASS — quarter-res target. Not a ping-pong FBO: it redraws
-//    40 circles every frame from a chain of points that lerp toward each other.
-// ---------------------------------------------------------------------------
+// Mouse trail, at quarter resolution. Not a ping-pong buffer — it redraws
+// 40 circles a frame from a chain of points that ease toward each other.
 const quadVert = /* glsl */`
   varying vec2 vUv;
   void main() {
@@ -314,10 +314,7 @@ const trailFrag = /* glsl */`
   }
 `;
 
-// ---------------------------------------------------------------------------
-// 4. ASCII PASS — fullscreen quad. Pixelate to a grid, read the cell's
-//    luminance, pick a glyph, sample the atlas.
-// ---------------------------------------------------------------------------
+// ASCII pass: pixelate to a grid, read each cell's luminance, pick a glyph.
 const asciiFrag = /* glsl */`
   precision highp float;
 
@@ -342,14 +339,10 @@ const asciiFrag = /* glsl */`
 
   const float GRID = 16.0;  // atlas is 16x16 cells
 
-  // Average the cell footprint rather than point-sampling its centre. With one
-  // tap a cell flips glyph the instant that single texel crosses a ramp
-  // boundary, so slow motion makes cells pop individually.
-  //
-  // The /3.0 spread is measured, not arbitrary — it beat both /4.0 and /2.0 at
-  // every rotation step. /4.0 samples so close to the centre it inherits the
-  // point-sample pops; /2.0 puts the outer taps on the cell boundary, so
-  // neighbouring cells share them and respond in unison.
+  // Averaging the cell beats point-sampling its centre, which pops a whole glyph
+  // the instant one texel crosses a ramp boundary.
+  // The /3.0 spread is measured — /4.0 sits too near the centre to help,
+  // and /2.0 puts the outer taps on the boundary where neighbours share them.
   vec4 cellAverage(vec2 uv, vec2 cell) {
     vec4 sum = vec4(0.0);
     for (int j = -1; j <= 1; j++) {
@@ -360,14 +353,12 @@ const asciiFrag = /* glsl */`
     return sum / 9.0;
   }
 
-  // Read one glyph out of the atlas. screenUV picks where inside the cell to
-  // look; index picks which of the 16x16 atlas cells to read from.
   float glyph(float index, vec2 screenUV, vec2 division) {
     float charX = mod(index, GRID);
     float charY = floor(index / GRID);
 
     vec2 charUV = mod(screenUV * (division / GRID), 1.0 / GRID);
-    charUV.y -= 1.0 / GRID;                     // canvas rows run top-down, UV runs bottom-up
+    charUV.y -= 1.0 / GRID;                     // canvas rows run top-down, UV bottom-up
     charUV   += vec2(charX, -charY) / GRID;
 
     return texture2D(uCharactersTexture, charUV).r;
@@ -388,23 +379,20 @@ const asciiFrag = /* glsl */`
 
     vec4 mouseTrail = texture2D(tMouseTrail, screenUV);
 
-    // --- matrix column motion ---
-    // Each column scrolls at its own rate. The glyph grid below is sampled at
-    // screenUV, so the cells stay put and only their content streams.
+    // Each column scrolls at its own rate. The atlas is sampled at screenUV,
+    // so the cells stay put and only their content streams.
     if (uMatrix) {
       float noise = random(pixelizedUV.x);
       pixelizedUV.y += uTime * uMatrixSpeed * abs(noise);
       pixelizedUV.y  = fract(pixelizedUV.y);
     }
 
-    // --- exit lift ---
-    // Computed here (before smear touches .x) but applied after it. Each column
-    // leaves at its own rate, so the frame empties raggedly rather than as a band.
+    // Computed before smear touches .x, applied after.
+    // Each column leaves at its own rate so the frame empties raggedly.
     float columnNoise = random(floor(pixelizedUV.x * division.x));
     float exitLift    = uOutProgress * (1.2 + columnNoise);
 
-    // --- smear / waterfall ---
-    // Rows below the smear front collapse onto the bottom row and fade out.
+    // Rows below the front collapse onto the bottom row and fade out.
     float waterfallAlpha = 1.0;
 
     if (uSmear > 0.0) {
@@ -453,8 +441,8 @@ const asciiFrag = /* glsl */`
 
     vec4 pixelizedColor = cellAverage(pixelizedUV, d);
 
-    // alpha carries two things (see the scene shader): anything above 0.25 is
-    // surface, and whatever sits above 0.5 is the reveal wipe's edge band.
+    // Alpha carries two things: above 0.25 is surface,
+    // and whatever sits above 0.5 is the wipe's edge band.
     float visible = step(0.25, pixelizedColor.a);
     float band    = clamp((pixelizedColor.a - 0.5) * 2.0, 0.0, 1.0) * visible;
     float gray    = grayscale(pixelizedColor.rgb) * visible;
@@ -467,23 +455,20 @@ const asciiFrag = /* glsl */`
     float down  = grayscale(cellAverage(pixelizedUV + vec2(0.0, -texel.y), d).rgb);
     float edgeMask = smoothstep(0.01, 0.25, length(vec2(right - left, up - down)));
 
-    // --- glyph selection ---
-    // The trail overrides the glyph index, but only on edges — otherwise it
-    // punches flat holes through the middle of the shape.
+    // The trail overrides the glyph index, but only on edges,
+    // otherwise it punches flat holes through the middle of the shape.
     float baseF  = gray * (uCharactersLimit - 1.0);
     float trailF = mouseTrail.r * (uCharactersLimit - 1.0);
     float trailInfluence = step(0.1, mouseTrail.r) * edgeMask;
     float f = mix(baseF, trailF, trailInfluence);
 
-    // Cross-fade the pair the ramp position falls between, so a cell dissolves
-    // from one character into the next instead of snapping. i1 is clamped so the
-    // brightest cells cannot bleed into the blank slot past the ramp's end.
+    // Cross-fade the pair the ramp falls between, so a cell dissolves from one
+    // character into the next. i1 is clamped off the blank slot past the ramp's end.
     float i0 = floor(f);
     float i1 = min(i0 + 1.0, uCharactersLimit - 1.0);
 
     float ascii = mix(glyph(i0, screenUV, division), glyph(i1, screenUV, division), fract(f));
 
-    // --- grain ---
     if (uNoise) {
       float n = noise2D(pixelizedUV * 120.0 + uTime * 0.033);
       ascii *= mix(0.6, 1.4, smoothstep(0.5, 0.9, n));
@@ -497,7 +482,7 @@ const asciiFrag = /* glsl */`
     float accent = clamp(max(mouseTrail.r * edgeMask, band), 0.0, 1.0) * ascii;
     color = mix(color, uAccentColor, accent);
 
-    // Keep the model's darkest cells off pure black. Only where the model is,
+    // Keep the darkest cells off pure black, only where the model is,
     // so the surrounding void stays exactly uBackground.
     color = max(color, vec3(uBrightnessFloor) * visible);
 
@@ -510,7 +495,7 @@ const asciiFrag = /* glsl */`
 // ---------------------------------------------------------------------------
 const renderer = new THREE.WebGLRenderer({ antialias: false });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
-renderer.setClearColor(0x000000, 0);   // empty pixels stay alpha 0 -> darkest glyph
+renderer.setClearColor(0x000000, 0);   // empty pixels stay alpha 0
 document.body.appendChild(renderer.domElement);
 
 const target      = new THREE.WebGLRenderTarget(1, 1);
@@ -534,9 +519,8 @@ const camera = new THREE.PerspectiveCamera(CONFIG.fov, 1, 0.1, 100);
   camera.lookAt(0, 0, 0);
 }
 
-// One material per CONFIG.surfaces entry. uReveal is a single uniform object
-// shared by all of them, so the wipe stays in lockstep off one tween instead of
-// needing to be broadcast — the per-surface uniforms are the only ones that differ.
+// One material per surface. uReveal is a single shared uniform object,
+// so the wipe stays in lockstep off one tween instead of being broadcast.
 const revealUniform = { value: CONFIG.reveal };
 
 const materials = Object.fromEntries(
@@ -550,14 +534,12 @@ const materials = Object.fromEntries(
       uNormalStrength: { value: spec.normalStrength },
       uReveal:         revealUniform,
     },
-    // Thin geometry has no back — cull it and the undersides vanish. On this
-    // model that was hiding 45-100% of the drawn pixels depending on the angle.
-    side: THREE.DoubleSide,
+    side: THREE.DoubleSide,   // thin geometry has no back; culling loses the undersides
   })])
 );
 
-// Walk up the ancestry so a match on a group covers every mesh beneath it —
-// glTF meshes usually carry exporter-generated names, their parents don't.
+// Walk up the ancestry so a match on a group covers every mesh beneath it.
+// glTF meshes usually carry exporter-generated names; their parents don't.
 function surfaceFor(object) {
   for (const [name, spec] of Object.entries(CONFIG.surfaces)) {
     if (!spec.match) continue;
@@ -574,8 +556,8 @@ scene.add(subject);
 let mixer = null, clipDuration = 0, cameraRig = null;
 const _rigTarget = new THREE.Vector3();
 
-// Centre on the origin and scale to a predictable size, so any .glb frames the
-// same way regardless of the units it was authored in.
+// Centre and scale to a predictable size, so any model frames the same way
+// regardless of the units it was authored in.
 function fitToView(object) {
   const box    = new THREE.Box3().setFromObject(object);
   const sphere = box.getBoundingSphere(new THREE.Sphere());
@@ -602,17 +584,12 @@ async function loadModel(url) {
       if (!o.isMesh) return;
       // Drop whatever material the file shipped with.
       o.material = surfaceFor(o);
-      // Everything here is shaded from normals, and plenty of glTF files ship
-      // without them (Fox.glb carries only POSITION/TEXCOORD/JOINTS/WEIGHTS).
-      // Without this the shader normalises a zero vector and the model renders
-      // as flat white. Bind-pose normals are correct — the vertex shader skins
-      // them afterwards.
+      // Plenty of glTF files ship without normals, and this shades from nothing else.
+      // Bind-pose normals are correct; the vertex shader skins them afterwards.
       if (!o.geometry.attributes.normal) {
-        // On non-indexed geometry computeVertexNormals gives every triangle its
-        // own normal, which reads as faceted. Weld coincident vertices first so
-        // each normal is the average of the faces meeting there and the shading
-        // runs smoothly across face boundaries. UVs are unused here and their
-        // seams would block welding, so drop them before merging.
+        // On non-indexed geometry computeVertexNormals gives every triangle its own
+        // normal, which reads as faceted. Welding first averages across shared faces.
+        // UV seams would block the weld, and nothing here reads UVs.
         if (!o.geometry.index) {
           if (o.geometry.attributes.uv) o.geometry.deleteAttribute('uv');
           o.geometry = mergeVertices(o.geometry);
@@ -639,8 +616,30 @@ async function loadModel(url) {
     }
     return gltf;
   } finally {
-    draco.dispose();   // frees the decoder worker either way
+    draco.dispose();
   }
+}
+
+// Swap the subject for another model, resetting everything the previous one owned.
+// Falls back to the placeholder so a bad URL leaves something on screen.
+let currentModel = CONFIG.model;
+async function setModel(url, label) {
+  const shown = label ?? url;
+  setStatus('loading ' + shown + ' …');
+  subject.clear();
+  mixer = null; clipDuration = 0; cameraRig = null;
+  try {
+    const gltf = await loadModel(url);
+    currentModel = shown;
+    const clips = gltf.animations.length;
+    setStatus('loaded ' + shown + (clips ? '  (' + clips + ' clip' + (clips > 1 ? 's' : '') + ')'
+                                         : '  (no animation)'));
+  } catch (err) {
+    console.error(err);
+    addPlaceholder();
+    setStatus('failed: ' + String(err.message || err).slice(0, 70));
+  }
+  playReveal();
 }
 
 function addPlaceholder() {
@@ -725,7 +724,7 @@ function resize() {
   const w = innerWidth, h = innerHeight, dpr = renderer.getPixelRatio();
   renderer.setSize(w, h);
   target.setSize(Math.round(w * dpr), Math.round(h * dpr));
-  trailTarget.setSize(Math.ceil(w * dpr / 4), Math.ceil(h * dpr / 4));   // trail runs at quarter res
+  trailTarget.setSize(Math.ceil(w * dpr / 4), Math.ceil(h * dpr / 4));
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   asciiMaterial.uniforms.uResolution.value.set(w, h);
@@ -770,8 +769,8 @@ const drawHud = () => {
     + `[r] reveal ${revealUniform.value.toFixed(2)}   [e] exit ${u.uOutProgress.value.toFixed(2)}   `
     + `scroll ${(scrollValue * 100).toFixed(0)}%   move the mouse for the trail`;
 };
-// The entrance: the scene pass uncovers the surface by normal while the ASCII
-// pass drops the columns back down. Two passes, one gesture.
+// The entrance: the scene pass uncovers the surface while the ASCII pass
+// drops the columns back down. Two passes, one gesture.
 function playReveal() {
   revealUniform.value = 1;
   tween(revealUniform, 0, CONFIG.revealDuration);
@@ -782,6 +781,95 @@ function playReveal() {
     tween(lift, 0, CONFIG.revealLiftDuration);
   }
 }
+
+// ---------------------------------------------------------------------------
+// Panel
+// ---------------------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+const setStatus = (msg) => { $('status').textContent = msg; };
+
+$('pick').onclick = () => $('file').click();
+$('file').onchange = (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  // An object URL loads without a server, but sibling .bin/texture files
+  // can't be resolved from one, so this is .glb only in practice.
+  setModel(URL.createObjectURL(f), f.name);
+};
+$('url').onkeydown = (e) => {
+  if (e.key !== 'Enter' || !e.target.value.trim()) return;
+  setModel(e.target.value.trim());
+};
+
+$('spin').checked = CONFIG.spin;
+$('spin').onchange = (e) => { CONFIG.spin = e.target.checked; };
+
+$('effect').value = CONFIG.scrollEffect;
+$('effect').onchange = (e) => {
+  resetScrollEffects();
+  CONFIG.scrollEffect = e.target.value;
+  scrollTarget = scrollValue = 0;
+  drawHud();
+};
+
+const bindSlider = (id, get, set) => {
+  const el = $(id);
+  el.value = get();
+  el.oninput = () => set(parseFloat(el.value));
+};
+bindSlider('gran',  () => asciiMaterial.uniforms.uGranularity.value,
+                    (v) => { asciiMaterial.uniforms.uGranularity.value = v; });
+bindSlider('limit', () => asciiMaterial.uniforms.uCharactersLimit.value,
+                    (v) => { asciiMaterial.uniforms.uCharactersLimit.value = v; });
+bindSlider('fit',   () => CONFIG.fitRadius,
+                    (v) => { CONFIG.fitRadius = v; refit(); });
+bindSlider('remap', () => CONFIG.surfaces.default.remapColor[0],
+                    (v) => { materials.default.uniforms.uRemapColor.value.setScalar(v);
+                             CONFIG.surfaces.default.remapColor = [v, v, v]; });
+
+// fitToView runs once at load, so resizing re-runs it.
+// The previous fit has to be undone first or each call compounds on the last.
+function refit() {
+  const holder = subject.children[0];
+  if (!holder) return;
+  holder.scale.setScalar(1);
+  holder.position.set(0, 0, 0);
+  fitToView(holder);
+}
+
+// Emit the current settings as a CONFIG block.
+$('copy').onclick = async () => {
+  const u = asciiMaterial.uniforms;
+  const n = (v, d = 2) => Number(v).toFixed(d).replace(/\.?0+$/, '');
+  const code = [
+    '// Generated by ASCII Globs. Paste over the matching keys in CONFIG.',
+    'model:        ' + JSON.stringify(currentModel) + ',',
+    'characters:   ' + JSON.stringify(CONFIG.characters) + ',',
+    'charLimit:    ' + n(u.uCharactersLimit.value, 0) + ',',
+    'granularity:  ' + n(u.uGranularity.value, 0) + ',',
+    'color:        ' + JSON.stringify(CONFIG.color) + ',',
+    'accentColor:  ' + JSON.stringify(CONFIG.accentColor) + ',',
+    'background:   ' + JSON.stringify(CONFIG.background) + ',',
+    'fov:          ' + n(CONFIG.fov, 0) + ',',
+    'fitRadius:    ' + n(CONFIG.fitRadius) + ',',
+    'spin:         ' + CONFIG.spin + ',',
+    'idleSpin:     ' + n(CONFIG.idleSpin) + ',',
+    'scrollEffect: ' + JSON.stringify(CONFIG.scrollEffect) + ',',
+    'surfaces: { default: {',
+    '  remapColor:     [' + CONFIG.surfaces.default.remapColor.map((v) => n(v)).join(', ') + '],',
+    '  lightDir:       [' + CONFIG.surfaces.default.lightDir.join(', ') + '],',
+    '  brightness:     ' + n(CONFIG.surfaces.default.brightness) + ',',
+    '  normalStrength: ' + n(CONFIG.surfaces.default.normalStrength) + ',',
+    '} },',
+  ].join('\n');
+  try {
+    await navigator.clipboard.writeText(code);
+    setStatus('config copied to clipboard');
+  } catch {
+    console.log(code);
+    setStatus('clipboard blocked — config logged to console');
+  }
+};
 
 addEventListener('keydown', (e) => {
   const u = asciiMaterial.uniforms;
@@ -796,8 +884,36 @@ addEventListener('keydown', (e) => {
 drawHud();
 playReveal();   // on load
 
-// Position the camera for a point on the scroll. Between keyframes it eases on
-// position and pitch; past the last one it orbits at fixed height and radius.
+// Only one effect runs at a time; switching resets whatever the last one drove.
+function applyScroll(p) {
+  const u = asciiMaterial.uniforms;
+  switch (CONFIG.scrollEffect) {
+    case 'clip':  if (mixer) mixer.setTime(p * clipDuration); break;
+    case 'smear': u.uSmear.value = p; break;
+    case 'exit':  u.uOutProgress.value = p; break;
+    // orbit and dolly move the camera, handled in the render loop
+  }
+}
+
+function resetScrollEffects() {
+  const u = asciiMaterial.uniforms;
+  u.uSmear.value = 0;
+  u.uOutProgress.value = 0;
+  if (mixer) mixer.setTime(0);
+  placeStaticCamera();
+}
+
+function placeStaticCamera(distanceScale = 1, angle = 0) {
+  const elev = THREE.MathUtils.degToRad(CONFIG.cameraElevation);
+  const d = CONFIG.cameraDistance * distanceScale;
+  camera.position.set(Math.sin(angle) * Math.cos(elev) * d,
+                      Math.sin(elev) * d,
+                      Math.cos(angle) * Math.cos(elev) * d);
+  camera.lookAt(0, 0, 0);
+}
+
+// Between keyframes this eases position and bias.
+// Past the last one it orbits at fixed height and radius.
 const _camPos = new THREE.Vector3();
 const ease = (k) => k * k * (3.0 - 2.0 * k);
 
@@ -816,8 +932,7 @@ function placeCamera(progress) {
                 a.pos[2] + (b.pos[2] - a.pos[2]) * k);
     bias = a.pitchBias + (b.pitchBias - a.pitchBias) * k;
   } else {
-    // x = r*sin(phi), z = r*cos(phi): increasing phi runs +Z toward +X, which
-    // reads counterclockwise looking down the +Y axis.
+    // Increasing phi runs +Z toward +X, which reads counterclockwise from above.
     const radius = Math.hypot(last.pos[0], last.pos[2]);
     const phi0   = Math.atan2(last.pos[0], last.pos[2]);
     const k      = ease(Math.min(1, (progress - last.at) / (1 - last.at)));
@@ -826,10 +941,8 @@ function placeCamera(progress) {
     bias = last.pitchBias + (CONFIG.orbitEndPitchBias - last.pitchBias) * k;
   }
 
-  // fitToView centres the model on the origin, so that is what we aim at.
   camera.position.copy(_camPos);
   camera.lookAt(0, 0, 0);
-  // Local +X rotation tilts the -Z forward axis toward +Y, so negate to drop.
   if (bias) camera.rotateX(-THREE.MathUtils.degToRad(bias));
 }
 
@@ -839,21 +952,26 @@ renderer.setAnimationLoop((ms) => {
   const dt = Math.min(0.05, t - prevTime);
   prevTime = t;
 
-  subject.rotation.set(0, THREE.MathUtils.degToRad(CONFIG.subjectYaw) + t * CONFIG.idleSpin, 0);
-  subject.position.y = Math.sin(t * 0.6) * CONFIG.idleBob;
+  const yaw = THREE.MathUtils.degToRad(CONFIG.subjectYaw);
+  subject.rotation.set(0, CONFIG.spin ? yaw + t * CONFIG.idleSpin : yaw, 0);
+  subject.position.y = CONFIG.spin ? Math.sin(t * 0.6) * CONFIG.idleBob : 0;
 
   scrollValue += (scrollTarget - scrollValue) * CONFIG.scrollDamping;
-  if (mixer) mixer.setTime(scrollValue * clipDuration);
+  applyScroll(scrollValue);
   asciiMaterial.uniforms.uTime.value = t;
 
   if (cameraRig) {
-    // The rig lives inside the subject, so its world matrices are only current
-    // once the scrubbed pose has been flushed down the graph.
+    // The rig sits inside the subject, so its world matrices are only current
+    // once the scrubbed pose has flushed down the graph.
     subject.updateMatrixWorld(true);
     camera.position.setFromMatrixPosition(cameraRig.follow.matrixWorld);
     camera.lookAt(_rigTarget.setFromMatrixPosition(cameraRig.lookAt.matrixWorld));
   } else if (CONFIG.useCameraPath) {
     placeCamera(scrollValue);
+  } else if (CONFIG.scrollEffect === 'orbit') {
+    placeStaticCamera(1, scrollValue * Math.PI * 2 * CONFIG.orbitTurns);
+  } else if (CONFIG.scrollEffect === 'dolly') {
+    placeStaticCamera(1 + scrollValue * (CONFIG.dollyRange - 1));
   }
 
   updateTweens(dt);
