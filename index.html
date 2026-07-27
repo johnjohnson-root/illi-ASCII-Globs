@@ -91,7 +91,10 @@ const CONFIG = {
   // working. Swap in your own model and it will be framed the same way.
   model:     'models/avocado.gltf',
   dracoPath: 'libs/draco/',
-  fitRadius: 1.6,       // model is scaled so its bounding sphere matches this
+  // Model is scaled so its bounding sphere matches this. The camera sees
+  // 2 * 5 * tan(17.5deg) = 3.15 units of height, so anything above 1.57 can
+  // clip a model that fills its bounding sphere vertically.
+  fitRadius: 1.4,
 };
 
 const TRAIL_LENGTH = 40;
