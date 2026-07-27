@@ -68,34 +68,31 @@ Drag rotates on both axes, with pitch clamped short of vertical. The orientation
 you leave it at survives toggling spin back on.
 
 Under **effects**: matrix rain, film grain, smear amount, melt amount, a scroll
-position you can scrub directly, a button to replay the entrance, and a toggle
-for the click lean described below.
+position you can scrub directly, and a button to replay the entrance.
 
 ### Click reactions
 
 Click the left half of the model and it plays the stretch of its clip where the
-head turns left, then eases back to wherever the scroll had it. The right half
-does the same the other way. Scroll scrubbing stands down while a reaction runs,
-and a fresh click cuts off one already playing.
+head turns left. The right half does the same the other way. Scroll scrubbing
+stands down while it runs.
 
-The windows are in `CONFIG.reactions` as timecodes in seconds. The shipped
-values were measured off the fox's head bone rather than eyeballed — its yaw
-against the neck sits neutral, sweeps to +47 degrees left by 1.25s, returns, then
-sweeps to -38 degrees right by the end of the clip:
+At the end of the turn the clip freezes for `reactionHold`, then hands back —
+rebasing the scroll to where the turn ended, so the animation carries on from
+that position rather than snapping back. `reactionCooldown` sets how long before
+another click registers.
+
+Windows are a fraction of the clip, the same units the scroll readout shows, so
+they can be read straight off the slider:
 
 ```js
 reactions: {
-  left:  { from: 0.68, to: 1.25 },
-  right: { from: 2.76, to: 3.42 },
+  left:  { from: 0.36, to: 0.58 },
+  right: { from: 0.78, to: 1.00 },
 },
 ```
 
-Another model will want different numbers. Sample its head bone across the clip
-and look for the monotonic stretches either side of neutral.
-
-**click lean** adds a small camera-space push toward wherever you clicked, on top
-of whatever the clip and scroll effects are already doing. `reactionPushAmount`
-sets how far.
+Another model will want different numbers. Scrub until the head is where you
+want it and note the scroll value at each end.
 
 Keys still work and stay in sync with the panel: `m` matrix, `n` grain,
 `[` `]` smear, `r` replay entrance, `e` dissolve.
