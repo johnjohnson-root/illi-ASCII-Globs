@@ -39,11 +39,29 @@ const CONFIG = {
   accentColor:'#ff8033',            // trail highlight (site theme-orange: 1.0, 0.5, 0.2)
   background: '#0a0a0a',
 
-  // model shading
-  remapColor:     [0.85, 0.85, 0.85],  // site: [0.35, 0.35, 0.35] — much sparser glyphs
-  lightDir:       [0.0, 0.8, 1.0],
-  brightness:     0.5,
-  normalStrength: 1.5,
+  // Model shading, one entry per surface. `match` is tested against the mesh's
+  // own name and every ancestor's, so naming a group in Blender is enough to
+  // shade its whole subtree. First match wins; `default` catches the rest.
+  //
+  // The site splits its hero the same way: the insect gets a flat grey remap
+  // and hard light, the perch a cooler tint and much softer normals, picked
+  // apart with getObjectByName('Branch002'). Note glTF node names are
+  // sanitised on load — Blender's 'Branch.002' arrives as 'Branch002'.
+  surfaces: {
+    branch: {
+      match:          /^branch/i,
+      remapColor:     [0.69, 0.90, 0.90],   // site's exact perch values
+      lightDir:       [0.0, 2.0, 1.0],
+      brightness:     0.2,
+      normalStrength: 0.5,
+    },
+    default: {
+      remapColor:     [0.85, 0.85, 0.85],   // site: [0.35, 0.35, 0.35] — much sparser glyphs
+      lightDir:       [0.0, 0.8, 1.0],
+      brightness:     0.5,
+      normalStrength: 1.5,
+    },
+  },
 
   noise: true,
   matrix: false,        // per-column vertical scroll
@@ -386,19 +404,36 @@ const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 100);
 camera.position.z = 5;
 
-// One material for every mesh in the subject. dragonfly.xyz uses two instances
-// with different uRemapColor — one for the insect, one for the branch.
-const surfaceMaterial = new THREE.ShaderMaterial({
-  vertexShader: sceneVert,
-  fragmentShader: sceneFrag,
-  uniforms: {
-    uRemapColor:     { value: new THREE.Vector3(...CONFIG.remapColor) },
-    uLightDir:       { value: new THREE.Vector3(...CONFIG.lightDir) },
-    uBrightness:     { value: CONFIG.brightness },
-    uNormalStrength: { value: CONFIG.normalStrength },
-    uReveal:         { value: CONFIG.reveal },
-  },
-});
+// One material per CONFIG.surfaces entry. uReveal is a single uniform object
+// shared by all of them, so the wipe stays in lockstep off one tween instead of
+// needing to be broadcast — the per-surface uniforms are the only ones that differ.
+const revealUniform = { value: CONFIG.reveal };
+
+const materials = Object.fromEntries(
+  Object.entries(CONFIG.surfaces).map(([name, spec]) => [name, new THREE.ShaderMaterial({
+    vertexShader: sceneVert,
+    fragmentShader: sceneFrag,
+    uniforms: {
+      uRemapColor:     { value: new THREE.Vector3(...spec.remapColor) },
+      uLightDir:       { value: new THREE.Vector3(...spec.lightDir) },
+      uBrightness:     { value: spec.brightness },
+      uNormalStrength: { value: spec.normalStrength },
+      uReveal:         revealUniform,
+    },
+  })])
+);
+
+// Walk up the ancestry so a match on a group covers every mesh beneath it —
+// glTF meshes usually carry exporter-generated names, their parents don't.
+function surfaceFor(object) {
+  for (const [name, spec] of Object.entries(CONFIG.surfaces)) {
+    if (!spec.match) continue;
+    for (let node = object; node; node = node.parent) {
+      if (spec.match.test(node.name)) return materials[name];
+    }
+  }
+  return materials.default;
+}
 
 const subject = new THREE.Group();
 scene.add(subject);
@@ -428,7 +463,7 @@ async function loadModel(url) {
     const gltf = await loader.loadAsync(url);
 
     // Drop whatever materials the file shipped with.
-    gltf.scene.traverse((o) => { if (o.isMesh) o.material = surfaceMaterial; });
+    gltf.scene.traverse((o) => { if (o.isMesh) o.material = surfaceFor(o); });
 
     const holder = new THREE.Group();
     holder.add(gltf.scene);
@@ -446,7 +481,7 @@ async function loadModel(url) {
 }
 
 function addPlaceholder() {
-  subject.add(new THREE.Mesh(new THREE.TorusKnotGeometry(1, 0.36, 220, 32), surfaceMaterial));
+  subject.add(new THREE.Mesh(new THREE.TorusKnotGeometry(1, 0.36, 220, 32), materials.default));
 }
 
 if (CONFIG.model) {
@@ -557,25 +592,25 @@ function updateTweens(dt) {
 // -- controls
 const hud = document.getElementById('hud');
 const drawHud = () => {
-  const u = asciiMaterial.uniforms, m = surfaceMaterial.uniforms;
+  const u = asciiMaterial.uniforms;
   hud.textContent =
     `[m] matrix ${u.uMatrix.value ? 'on ' : 'off'}   [n] grain ${u.uNoise.value ? 'on ' : 'off'}   `
     + `[ / ] smear ${u.uSmear.value.toFixed(2)}\n`
-    + `[r] reveal ${m.uReveal.value.toFixed(2)}   [e] exit ${u.uOutProgress.value.toFixed(2)}   `
+    + `[r] reveal ${revealUniform.value.toFixed(2)}   [e] exit ${u.uOutProgress.value.toFixed(2)}   `
     + `move the mouse for the trail`;
 };
 addEventListener('keydown', (e) => {
-  const u = asciiMaterial.uniforms, m = surfaceMaterial.uniforms;
+  const u = asciiMaterial.uniforms;
   if (e.key === 'm') u.uMatrix.value = !u.uMatrix.value;
   if (e.key === 'n') u.uNoise.value  = !u.uNoise.value;
   if (e.key === '[') u.uSmear.value = Math.max(0, u.uSmear.value - 0.05);
   if (e.key === ']') u.uSmear.value = Math.min(1, u.uSmear.value + 0.05);
-  if (e.key === 'r') { m.uReveal.value = 1; tween(m.uReveal, 0, CONFIG.revealDuration); }
+  if (e.key === 'r') { revealUniform.value = 1; tween(revealUniform, 0, CONFIG.revealDuration); }
   if (e.key === 'e') tween(u.uOutProgress, u.uOutProgress.value < 0.5 ? 1 : 0, CONFIG.exitDuration);
   drawHud();
 });
 drawHud();
-tween(surfaceMaterial.uniforms.uReveal, 0, CONFIG.revealDuration);   // wipe in on load
+tween(revealUniform, 0, CONFIG.revealDuration);   // wipe in on load
 
 let prevTime = 0;
 renderer.setAnimationLoop((ms) => {
