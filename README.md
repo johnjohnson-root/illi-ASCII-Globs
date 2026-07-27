@@ -67,7 +67,11 @@ change `characters` and the atlas regenerates.
 Drag rotates on both axes, with pitch clamped short of vertical. The orientation
 you leave it at survives toggling spin back on.
 
-Keys: `m` matrix, `n` grain, `[` `]` smear, `r` replay entrance, `e` dissolve.
+Under **effects**: matrix rain, film grain, smear amount, melt amount, a scroll
+position you can scrub directly, and a button to replay the entrance.
+
+Keys still work and stay in sync with the panel: `m` matrix, `n` grain,
+`[` `]` smear, `r` replay entrance, `e` dissolve.
 
 ### Scroll effects
 

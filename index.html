@@ -32,14 +32,9 @@
   #controls .row { display: flex; gap: 6px; }
   #controls .row > * { flex: 1; min-width: 0; }
   #status { color: #ff8033; min-height: 1.7em; overflow-wrap: anywhere; }
-  #hud {
-    position: fixed; left: 12px; bottom: 12px; z-index: 1;
-    font: 12px/1.6 ui-monospace, monospace; color: #666; white-space: pre;
-    pointer-events: none; user-select: none;
-  }
+  #controls b { font-weight: normal; color: #777; width: 3.2em; text-align: right; }
+  #controls .head { color: #666; letter-spacing: 0.06em; }
 </style>
-
-<div id="hud" class="panel"></div>
 
 <div id="controls" class="panel">
   <div class="row">
@@ -62,10 +57,18 @@
     </select>
   </label>
   <hr>
-  <label>cell <input type="range" id="gran"  min="2"   max="24"  step="1"></label>
-  <label>ramp <input type="range" id="limit" min="2"   max="16"  step="1"></label>
-  <label>size <input type="range" id="fit"   min="0.4" max="3.5" step="0.05"></label>
-  <label>tone <input type="range" id="remap" min="0.2" max="1.5" step="0.05"></label>
+  <label>cell <input type="range" id="gran"  min="2"   max="24"  step="1"><b id="gran-v"></b></label>
+  <label>ramp <input type="range" id="limit" min="2"   max="16"  step="1"><b id="limit-v"></b></label>
+  <label>size <input type="range" id="fit"   min="0.4" max="3.5" step="0.05"><b id="fit-v"></b></label>
+  <label>tone <input type="range" id="remap" min="0.2" max="1.5" step="0.05"><b id="remap-v"></b></label>
+  <hr>
+  <div class="head">effects</div>
+  <label>matrix <input type="checkbox" id="matrix"></label>
+  <label>grain <input type="checkbox" id="grain"></label>
+  <label>smear <input type="range" id="smear" min="0" max="1" step="0.01"><b id="smear-v"></b></label>
+  <label>melt <input type="range" id="melt"  min="0" max="1" step="0.01"><b id="melt-v"></b></label>
+  <label>scroll <input type="range" id="scroll" min="0" max="1" step="0.01"><b id="scroll-v"></b></label>
+  <button id="replay">replay entrance</button>
 </div>
 
 <script type="importmap">
@@ -796,15 +799,27 @@ addEventListener('wheel', (e) => {
 }, { passive: true });
 
 // -- controls
-const hud = document.getElementById('hud');
+// Push state back into the panel. Skips whatever has focus so a live drag
+// is not fought by the value it is producing.
 const drawHud = () => {
   const u = asciiMaterial.uniforms;
-  hud.textContent =
-    `[m] matrix ${u.uMatrix.value ? 'on ' : 'off'}   [n] grain ${u.uNoise.value ? 'on ' : 'off'}   `
-    + `[ / ] smear ${u.uSmear.value.toFixed(2)}\n`
-    + `[r] reveal ${revealUniform.value.toFixed(2)}   [e] exit ${u.uOutProgress.value.toFixed(2)}   `
-    + `scroll ${(scrollValue * 100).toFixed(0)}%   `
-    + (CONFIG.spin ? 'move the mouse for the trail' : 'drag to rotate');
+  const num = (id, v, dp) => {
+    const el = $(id), out = $(id + '-v');
+    if (el && document.activeElement !== el) el.value = v;
+    if (out) out.textContent = Number(v).toFixed(dp);
+  };
+  const flag = (id, v) => { const el = $(id); if (el) el.checked = v; };
+
+  num('gran',  u.uGranularity.value, 0);
+  num('limit', u.uCharactersLimit.value, 0);
+  num('fit',   CONFIG.fitRadius, 2);
+  num('remap', CONFIG.surfaces.default.remapColor[0], 2);
+  num('smear', u.uSmear.value, 2);
+  num('melt',  u.uOutProgress.value, 2);
+  num('scroll', scrollValue, 2);
+  flag('matrix', u.uMatrix.value);
+  flag('grain',  u.uNoise.value);
+  flag('spin',   CONFIG.spin);
 };
 // The entrance: the scene pass uncovers the surface while the ASCII pass
 // drops the columns back down. Two passes, one gesture.
@@ -852,7 +867,7 @@ $('effect').onchange = (e) => {
 const bindSlider = (id, get, set) => {
   const el = $(id);
   el.value = get();
-  el.oninput = () => set(parseFloat(el.value));
+  el.oninput = () => { set(parseFloat(el.value)); drawHud(); };
 };
 bindSlider('gran',  () => asciiMaterial.uniforms.uGranularity.value,
                     (v) => { asciiMaterial.uniforms.uGranularity.value = v; });
@@ -873,6 +888,17 @@ function refit() {
   holder.position.set(0, 0, 0);
   fitToView(holder);
 }
+
+$('matrix').onchange = (e) => { asciiMaterial.uniforms.uMatrix.value = e.target.checked; };
+$('grain').onchange  = (e) => { asciiMaterial.uniforms.uNoise.value  = e.target.checked; };
+$('replay').onclick  = () => playReveal();
+
+bindSlider('smear', () => asciiMaterial.uniforms.uSmear.value,
+                    (v) => { asciiMaterial.uniforms.uSmear.value = v; });
+bindSlider('melt',  () => asciiMaterial.uniforms.uOutProgress.value,
+                    (v) => { asciiMaterial.uniforms.uOutProgress.value = v; });
+// Setting both target and value skips the damping, so the slider tracks the drag.
+bindSlider('scroll', () => scrollValue, (v) => { scrollTarget = scrollValue = v; });
 
 // Emit the current settings as a CONFIG block.
 $('copy').onclick = async () => {
@@ -995,8 +1021,10 @@ renderer.setAnimationLoop((ms) => {
   subject.rotation.set(CONFIG.spin ? 0 : dragPitch, yaw, 0);
   subject.position.y = CONFIG.spin ? Math.sin(t * 0.6) * CONFIG.idleBob : 0;
 
+  const prevScroll = scrollValue;
   scrollValue += (scrollTarget - scrollValue) * CONFIG.scrollDamping;
   applyScroll(scrollValue);
+  if (Math.abs(scrollValue - prevScroll) > 1e-4) drawHud();
   asciiMaterial.uniforms.uTime.value = t;
 
   if (cameraRig) {
