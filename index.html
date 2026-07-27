@@ -9,6 +9,13 @@
     position: fixed; left: 12px; bottom: 12px; z-index: 1;
     font: 12px/1.6 ui-monospace, monospace; color: #666; white-space: pre;
     pointer-events: none; user-select: none;
+    /* Light fill; the blur is what makes the text readable over stipple.
+       Same approach the site uses on its own nav panel. */
+    background: rgba(10, 10, 10, 0.35);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    padding: 6px 10px;
+    border-radius: 2px;
   }
 </style>
 
@@ -33,7 +40,7 @@ import * as THREE from 'three';
 const CONFIG = {
   characters: ' * _<>,  ./O#SF +',  // glyph ramp, darkest -> densest
   charLimit:  15,                   // how many of them the luminance ramp maps onto (site: 16)
-  granularity: 4,                   // cell size in CSS px
+  granularity: 10,                  // cell size in CSS px
   fontSize:   72,                   // px, drawn into a 64px atlas cell
   color:      '#eeeeee',            // glyph colour
   accentColor:'#ff8033',            // trail highlight (site theme-orange: 1.0, 0.5, 0.2)
