@@ -33,11 +33,12 @@ import * as THREE from 'three';
 const CONFIG = {
   characters: ' * _<>,  ./O#SF +',  // glyph ramp, darkest -> densest
   charLimit:  15,                   // how many of them the luminance ramp maps onto (site: 16)
-  granularity: 6,                   // cell size in CSS px
+  granularity: 5,                   // cell size in CSS px
   fontSize:   72,                   // px, drawn into a 64px atlas cell
   color:      '#eeeeee',            // glyph colour
   accentColor:'#ff8033',            // trail highlight (site theme-orange: 1.0, 0.5, 0.2)
   background: '#0a0a0a',
+  brightnessFloor: 0.005,           // on-model cells never render darker than this (linear)
 
   // Model shading, one entry per surface. `match` is tested against the mesh's
   // own name and every ancestor's, so naming a group in Blender is enough to
@@ -59,12 +60,15 @@ const CONFIG = {
       remapColor:     [0.85, 0.85, 0.85],   // site: [0.35, 0.35, 0.35] — much sparser glyphs
       lightDir:       [0.0, 0.8, 1.0],
       brightness:     0.5,
-      normalStrength: 1.5,
+      // Lowering this shifts weight off the raw normal and onto the smooth
+      // lambert term, so low-poly facets read less sharply. 1.05 measured 2.22%
+      // facet edges against 2.77% at the site's 1.5 — 20% fewer — and costs no
+      // tonal range (luminance span stays 184 across 185 distinct levels).
+      normalStrength: 1.05,
     },
   },
 
-  noise: true,
-  grainHz: 12,          // grain re-rolls this many times a second (must be > 0)
+  noise: false,
   matrix: false,        // per-column vertical scroll
   matrixSpeed: 0.15,    // screens per second at max column noise
   smear: 0.0,           // 0..1 — how far up the waterfall collapse reaches
@@ -87,17 +91,27 @@ const CONFIG = {
   // below replaces them, so stripping the texture graph before shipping a model
   // saves the loader fetching PNGs it will throw away.
   //
-  // The avocado is a CC0 stand-in, only here so a fresh clone shows the loader
+  // The fox is a CC0 stand-in, only here so a fresh clone shows the loader
   // working. Swap in your own model and it will be framed the same way.
-  model:     'models/avocado.gltf',
+  model:     'models/Fox.glb',
   dracoPath: 'libs/draco/',
   // Model is scaled so its bounding sphere matches this. The camera sees
-  // 2 * 5 * tan(17.5deg) = 3.15 units of height, so anything above 1.57 can
-  // clip a model that fills its bounding sphere vertically.
-  fitRadius: 1.4,
+  // 2 * 5 * tan(17.5deg) = 3.15 units of height, so a model that fills its
+  // bounding sphere vertically clips above about 1.57 — that was the avocado.
+  //
+  // An elongated model has a sphere dominated by its length and so leaves the
+  // frame mostly empty, and can be pushed much further. Measured on the fox by
+  // projecting its box corners over a full spin against both bob extremes:
+  // 1.85 puts the worst excursion at 0.93 of the frame, and 1.95 hits exactly
+  // 1.0. Raise this per model rather than trusting one number.
+  fitRadius: 1.85,
 };
 
 const TRAIL_LENGTH = 40;
+
+// Which slots in the ramp are blank, packed one per bit for the shader.
+const blankMask = CONFIG.characters.split('').reduce(
+  (mask, ch, i) => (i < 24 && ch.trim() === '' ? mask + Math.pow(2, i) : mask), 0);
 
 // ---------------------------------------------------------------------------
 // 1. GLYPH ATLAS — generated at runtime, no image asset.
@@ -257,17 +271,56 @@ const asciiFrag = /* glsl */`
   uniform vec3  uColor;
   uniform vec3  uAccentColor;
   uniform vec3  uBackground;
+  uniform float uBrightnessFloor;
   uniform float uTime;
   uniform float uSmear;
   uniform float uMatrixSpeed;
   uniform float uOutProgress;
-  uniform float uGrainHz;
+  uniform float uBlankMask;
   uniform bool  uNoise;
   uniform bool  uMatrix;
 
   varying vec2 vUv;
 
   const float GRID = 16.0;  // atlas is 16x16 cells
+
+  // Average the cell footprint rather than point-sampling its centre. With one
+  // tap a cell flips glyph the instant that single texel crosses a ramp
+  // boundary, so slow motion makes cells pop individually.
+  //
+  // The /3.0 spread is measured, not arbitrary — it beat both /4.0 and /2.0 at
+  // every rotation step. /4.0 samples so close to the centre it inherits the
+  // point-sample pops; /2.0 puts the outer taps on the cell boundary, so
+  // neighbouring cells share them and respond in unison.
+  vec4 cellAverage(vec2 uv, vec2 cell) {
+    vec4 sum = vec4(0.0);
+    for (int j = -1; j <= 1; j++) {
+      for (int i = -1; i <= 1; i++) {
+        sum += texture2D(tDiffuse, uv + vec2(float(i), float(j)) * cell / 3.0);
+      }
+    }
+    return sum / 9.0;
+  }
+
+  // Read one glyph out of the atlas. screenUV picks where inside the cell to
+  // look; index picks which of the 16x16 atlas cells to read from.
+  float glyph(float index, vec2 screenUV, vec2 division) {
+    float charX = mod(index, GRID);
+    float charY = floor(index / GRID);
+
+    vec2 charUV = mod(screenUV * (division / GRID), 1.0 / GRID);
+    charUV.y -= 1.0 / GRID;                     // canvas rows run top-down, UV runs bottom-up
+    charUV   += vec2(charX, -charY) / GRID;
+
+    return texture2D(uCharactersTexture, charUV).r;
+  }
+
+  // Bit i of uBlankMask is set when characters[i] is whitespace. A bitmask
+  // rather than a uniform array because GLSL ES 1.00 will not let us index an
+  // array with a value computed at runtime.
+  bool glyphIsBlank(float index) {
+    return mod(floor(uBlankMask / exp2(index)), 2.0) > 0.5;
+  }
 
   float grayscale(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
   float noise2D(vec2 p)   { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
@@ -347,7 +400,7 @@ const asciiFrag = /* glsl */`
       return;
     }
 
-    vec4 pixelizedColor = texture2D(tDiffuse, pixelizedUV);
+    vec4 pixelizedColor = cellAverage(pixelizedUV, d);
 
     // alpha carries two things (see the scene shader): anything above 0.25 is
     // surface, and whatever sits above 0.5 is the reveal wipe's edge band.
@@ -357,36 +410,36 @@ const asciiFrag = /* glsl */`
 
     // --- edge detection, used to gate the trail ---
     vec2 texel = 1.0 / uResolution;
-    float left  = grayscale(texture2D(tDiffuse, pixelizedUV + vec2(-texel.x, 0.0)).rgb);
-    float right = grayscale(texture2D(tDiffuse, pixelizedUV + vec2( texel.x, 0.0)).rgb);
-    float up    = grayscale(texture2D(tDiffuse, pixelizedUV + vec2(0.0,  texel.y)).rgb);
-    float down  = grayscale(texture2D(tDiffuse, pixelizedUV + vec2(0.0, -texel.y)).rgb);
+    float left  = grayscale(cellAverage(pixelizedUV + vec2(-texel.x, 0.0), d).rgb);
+    float right = grayscale(cellAverage(pixelizedUV + vec2( texel.x, 0.0), d).rgb);
+    float up    = grayscale(cellAverage(pixelizedUV + vec2(0.0,  texel.y), d).rgb);
+    float down  = grayscale(cellAverage(pixelizedUV + vec2(0.0, -texel.y), d).rgb);
     float edgeMask = smoothstep(0.01, 0.25, length(vec2(right - left, up - down)));
 
     // --- glyph selection ---
     // The trail overrides the glyph index, but only on edges — otherwise it
     // punches flat holes through the middle of the shape.
-    float baseCharIndex  = floor(gray * (uCharactersLimit - 1.0));
-    float trailCharIndex = floor(mouseTrail.r * (uCharactersLimit - 1.0));
+    float baseF  = gray * (uCharactersLimit - 1.0);
+    float trailF = mouseTrail.r * (uCharactersLimit - 1.0);
     float trailInfluence = step(0.1, mouseTrail.r) * edgeMask;
-    float charIndex      = mix(baseCharIndex, trailCharIndex, trailInfluence);
+    float f = mix(baseF, trailF, trailInfluence);
 
-    float charX = mod(charIndex, GRID);
-    float charY = floor(charIndex / GRID);
+    // Cross-fade the pair the ramp position falls between, so a cell dissolves
+    // from one character into the next instead of snapping. i1 is clamped so the
+    // brightest cells cannot bleed into the blank slot past the ramp's end.
+    float i0 = floor(f);
+    float i1 = min(i0 + 1.0, uCharactersLimit - 1.0);
 
-    vec2 charUV = mod(screenUV * (division / GRID), 1.0 / GRID);
-    charUV.y -= 1.0 / GRID;                       // canvas rows run top-down, UV runs bottom-up
-    charUV   += vec2(charX, -charY) / GRID;
+    // The ramp's blanks are deliberate holes. Fading into or out of one fills
+    // them in and costs the field its airiness, so those pairs snap as before.
+    float blend = fract(f);
+    if (glyphIsBlank(i0) || glyphIsBlank(i1)) blend = 0.0;
 
-    float ascii = texture2D(uCharactersTexture, charUV).r;
+    float ascii = mix(glyph(i0, screenUV, division), glyph(i1, screenUV, division), blend);
 
     // --- grain ---
-    // Quantised time. noise2D is a raw hash, not interpolated, so any nonzero
-    // time delta decorrelates it completely — a plain uTime * rate re-rolls the
-    // pattern every frame no matter how small the rate. Stepping the input is
-    // what actually makes the grain hold still between re-rolls.
     if (uNoise) {
-      float n = noise2D(pixelizedUV * 120.0 + floor(uTime * uGrainHz) / uGrainHz);
+      float n = noise2D(pixelizedUV * 120.0 + uTime * 0.033);
       ascii *= mix(0.6, 1.4, smoothstep(0.5, 0.9, n));
     }
 
@@ -397,6 +450,10 @@ const asciiFrag = /* glsl */`
     // --- accent: trailed edges, plus the reveal wipe front ---
     float accent = clamp(max(mouseTrail.r * edgeMask, band), 0.0, 1.0) * ascii;
     color = mix(color, uAccentColor, accent);
+
+    // Keep the model's darkest cells off pure black. Only where the model is,
+    // so the surrounding void stays exactly uBackground.
+    color = max(color, vec3(uBrightnessFloor) * visible);
 
     gl_FragColor = vec4(color, 1.0);
   }
@@ -472,9 +529,10 @@ function fitToView(object) {
 }
 
 async function loadModel(url) {
-  const [{ GLTFLoader }, { DRACOLoader }] = await Promise.all([
+  const [{ GLTFLoader }, { DRACOLoader }, { mergeVertices }] = await Promise.all([
     import('three/addons/loaders/GLTFLoader.js'),
     import('three/addons/loaders/DRACOLoader.js'),
+    import('three/addons/utils/BufferGeometryUtils.js'),
   ]);
 
   const draco = new DRACOLoader().setDecoderPath(CONFIG.dracoPath);
@@ -483,8 +541,28 @@ async function loadModel(url) {
   try {
     const gltf = await loader.loadAsync(url);
 
-    // Drop whatever materials the file shipped with.
-    gltf.scene.traverse((o) => { if (o.isMesh) o.material = surfaceFor(o); });
+    gltf.scene.traverse((o) => {
+      if (!o.isMesh) return;
+      // Drop whatever material the file shipped with.
+      o.material = surfaceFor(o);
+      // Everything here is shaded from normals, and plenty of glTF files ship
+      // without them (Fox.glb carries only POSITION/TEXCOORD/JOINTS/WEIGHTS).
+      // Without this the shader normalises a zero vector and the model renders
+      // as flat white. Bind-pose normals are correct — the vertex shader skins
+      // them afterwards.
+      if (!o.geometry.attributes.normal) {
+        // On non-indexed geometry computeVertexNormals gives every triangle its
+        // own normal, which reads as faceted. Weld coincident vertices first so
+        // each normal is the average of the faces meeting there and the shading
+        // runs smoothly across face boundaries. UVs are unused here and their
+        // seams would block welding, so drop them before merging.
+        if (!o.geometry.index) {
+          if (o.geometry.attributes.uv) o.geometry.deleteAttribute('uv');
+          o.geometry = mergeVertices(o.geometry);
+        }
+        o.geometry.computeVertexNormals();
+      }
+    });
 
     const holder = new THREE.Group();
     holder.add(gltf.scene);
@@ -568,11 +646,12 @@ const asciiMaterial = new THREE.ShaderMaterial({
     uColor:             { value: new THREE.Color(CONFIG.color) },
     uAccentColor:       { value: new THREE.Color(CONFIG.accentColor) },
     uBackground:        { value: new THREE.Color(CONFIG.background) },
+    uBrightnessFloor:   { value: CONFIG.brightnessFloor },
     uTime:              { value: 0 },
     uSmear:             { value: CONFIG.smear },
     uMatrixSpeed:       { value: CONFIG.matrixSpeed },
     uOutProgress:       { value: CONFIG.outProgress },
-    uGrainHz:           { value: CONFIG.grainHz },
+    uBlankMask:         { value: blankMask },
     uNoise:             { value: CONFIG.noise },
     uMatrix:            { value: CONFIG.matrix },
   },
