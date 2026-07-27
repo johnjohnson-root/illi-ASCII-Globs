@@ -73,6 +73,13 @@ const CONFIG = {
   revealDuration: 1.4,  // seconds
   exitDuration:   0.9,
 
+  // The reveal transition also runs the exit lift backwards, so columns fall
+  // into place while the normal wipe uncovers the surface. Set revealLift to 0
+  // for a bare wipe. The lift settles first — ending on the wipe rather than on
+  // sliding geometry keeps the last beat still.
+  revealLift:         1.0,
+  revealLiftDuration: 1.0,
+
   // Point this at a .glb to replace the placeholder torus knot. Draco-compressed
   // files work as-is; the decoder is vendored in libs/draco/. Any materials and
   // textures in the file are discarded — the surface shader below replaces them.
@@ -599,18 +606,31 @@ const drawHud = () => {
     + `[r] reveal ${revealUniform.value.toFixed(2)}   [e] exit ${u.uOutProgress.value.toFixed(2)}   `
     + `move the mouse for the trail`;
 };
+// The entrance: the scene pass uncovers the surface by normal while the ASCII
+// pass drops the columns back down. Two passes, one gesture.
+function playReveal() {
+  revealUniform.value = 1;
+  tween(revealUniform, 0, CONFIG.revealDuration);
+
+  if (CONFIG.revealLift > 0) {
+    const lift = asciiMaterial.uniforms.uOutProgress;
+    lift.value = CONFIG.revealLift;
+    tween(lift, 0, CONFIG.revealLiftDuration);
+  }
+}
+
 addEventListener('keydown', (e) => {
   const u = asciiMaterial.uniforms;
   if (e.key === 'm') u.uMatrix.value = !u.uMatrix.value;
   if (e.key === 'n') u.uNoise.value  = !u.uNoise.value;
   if (e.key === '[') u.uSmear.value = Math.max(0, u.uSmear.value - 0.05);
   if (e.key === ']') u.uSmear.value = Math.min(1, u.uSmear.value + 0.05);
-  if (e.key === 'r') { revealUniform.value = 1; tween(revealUniform, 0, CONFIG.revealDuration); }
+  if (e.key === 'r') playReveal();
   if (e.key === 'e') tween(u.uOutProgress, u.uOutProgress.value < 0.5 ? 1 : 0, CONFIG.exitDuration);
   drawHud();
 });
 drawHud();
-tween(revealUniform, 0, CONFIG.revealDuration);   // wipe in on load
+playReveal();   // on load
 
 let prevTime = 0;
 renderer.setAnimationLoop((ms) => {
