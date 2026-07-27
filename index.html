@@ -68,6 +68,7 @@
   <label>smear <input type="range" id="smear" min="0" max="1" step="0.01"><b id="smear-v"></b></label>
   <label>melt <input type="range" id="melt"  min="0" max="1" step="0.01"><b id="melt-v"></b></label>
   <label>scroll <input type="range" id="scroll" min="0" max="1" step="0.01"><b id="scroll-v"></b></label>
+  <label>click lean <input type="checkbox" id="push"></label>
   <button id="replay">replay entrance</button>
 </div>
 
@@ -151,6 +152,18 @@ const CONFIG = {
   // With spin off, drag to turn the model by hand.
   dragSensitivity: 0.008,   // radians per pixel
   dragPitchLimit:  80,      // degrees, to stop it tipping past vertical
+
+  // Sub-ranges of the clip where the head turns each way, in seconds. Measured
+  // from the head bone's yaw against the neck rather than eyeballed: the clip
+  // sits neutral, swings to +47 deg left at 1.25, returns, then swings to
+  // -38 deg right by the end. Retune freely for another model.
+  reactions: {
+    left:  { from: 0.68, to: 1.25 },
+    right: { from: 2.76, to: 3.42 },
+  },
+  reactionReturn:     0.5,    // seconds easing back to wherever scroll left it
+  reactionPush:       false,  // lean the camera toward the click
+  reactionPushAmount: 0.35,   // world units at the frame edge
 
   // What the wheel drives. 'clip' scrubs the model's own animation and does
   // nothing on a model without one; the rest work on anything.
@@ -687,7 +700,29 @@ const mouseUV = new THREE.Vector2(0.5, 0.5);
 let lastMouseUV = new THREE.Vector2(0.5, 0.5);
 let velocity = 0;
 
+// A reaction owns the clip while it runs, so scroll scrubbing stands down.
+let reaction = null;
+const _modelCentre = new THREE.Vector3();
+
+function triggerReaction(ndcX, ndcY) {
+  if (!mixer || !clipDuration) return;
+  subject.updateMatrixWorld(true);
+  new THREE.Box3().setFromObject(subject).getCenter(_modelCentre);
+  _modelCentre.project(camera);
+
+  const side = ndcX < _modelCentre.x ? 'left' : 'right';
+  const w = CONFIG.reactions[side];
+  reaction = {
+    side, from: w.from, to: w.to,
+    playFor: Math.max(0.05, Math.abs(w.to - w.from)),
+    returnTo: scrollValue * clipDuration,
+    pushX: ndcX, pushY: ndcY,
+    elapsed: 0, envelope: 0,
+  };
+}
+
 let dragging = false, dragLastX = 0, dragLastY = 0, dragYaw = 0, dragPitch = 0;
+let downX = 0, downY = 0;
 const canvas = renderer.domElement;
 
 const setGrabCursor = () => {
@@ -696,6 +731,7 @@ const setGrabCursor = () => {
 };
 
 canvas.addEventListener('pointerdown', (e) => {
+  downX = e.clientX; downY = e.clientY;
   if (CONFIG.spin) return;
   dragging = true;
   dragLastX = e.clientX; dragLastY = e.clientY;
@@ -707,6 +743,11 @@ canvas.addEventListener('pointerup', (e) => {
   dragging = false;
   canvas.releasePointerCapture?.(e.pointerId);
   setGrabCursor();
+  // A press that barely moved is a click, not the end of a drag.
+  if (Math.hypot(e.clientX - downX, e.clientY - downY) > 4) return;
+  const r = canvas.getBoundingClientRect();
+  triggerReaction((e.clientX - r.left) / r.width * 2 - 1,
+                  -((e.clientY - r.top) / r.height * 2 - 1));
 });
 
 addEventListener('pointermove', (e) => {
@@ -892,6 +933,8 @@ function refit() {
 $('matrix').onchange = (e) => { asciiMaterial.uniforms.uMatrix.value = e.target.checked; };
 $('grain').onchange  = (e) => { asciiMaterial.uniforms.uNoise.value  = e.target.checked; };
 $('replay').onclick  = () => playReveal();
+$('push').checked    = CONFIG.reactionPush;
+$('push').onchange   = (e) => { CONFIG.reactionPush = e.target.checked; };
 
 bindSlider('smear', () => asciiMaterial.uniforms.uSmear.value,
                     (v) => { asciiMaterial.uniforms.uSmear.value = v; });
@@ -952,7 +995,7 @@ playReveal();   // on load
 function applyScroll(p) {
   const u = asciiMaterial.uniforms;
   switch (CONFIG.scrollEffect) {
-    case 'clip':  if (mixer) mixer.setTime(p * clipDuration); break;
+    case 'clip':  if (mixer && !reaction) mixer.setTime(p * clipDuration); break;
     case 'smear': u.uSmear.value = p; break;
     case 'exit':  u.uOutProgress.value = p; break;
     // orbit and dolly move the camera, handled in the render loop
@@ -979,6 +1022,7 @@ function placeStaticCamera(distanceScale = 1, angle = 0) {
 // Between keyframes this eases position and bias.
 // Past the last one it orbits at fixed height and radius.
 const _camPos = new THREE.Vector3();
+const _pushRight = new THREE.Vector3(), _pushUp = new THREE.Vector3();
 const ease = (k) => k * k * (3.0 - 2.0 * k);
 
 function placeCamera(progress) {
@@ -1010,6 +1054,24 @@ function placeCamera(progress) {
   if (bias) camera.rotateX(-THREE.MathUtils.degToRad(bias));
 }
 
+// Plays the window once, then eases the clip back to wherever scroll left it.
+function stepReaction(dt) {
+  if (!reaction) return;
+  reaction.elapsed += dt;
+
+  if (reaction.elapsed <= reaction.playFor) {
+    const k = reaction.elapsed / reaction.playFor;
+    mixer.setTime(reaction.from + (reaction.to - reaction.from) * k);
+    reaction.envelope = ease(k);
+    return;
+  }
+
+  const k = Math.min(1, (reaction.elapsed - reaction.playFor) / CONFIG.reactionReturn);
+  mixer.setTime(reaction.to + (reaction.returnTo - reaction.to) * ease(k));
+  reaction.envelope = 1 - ease(k);
+  if (k >= 1) reaction = null;
+}
+
 let prevTime = 0;
 renderer.setAnimationLoop((ms) => {
   const t = ms * 0.001;
@@ -1025,6 +1087,8 @@ renderer.setAnimationLoop((ms) => {
   scrollValue += (scrollTarget - scrollValue) * CONFIG.scrollDamping;
   applyScroll(scrollValue);
   if (Math.abs(scrollValue - prevScroll) > 1e-4) drawHud();
+
+  stepReaction(dt);
   asciiMaterial.uniforms.uTime.value = t;
 
   if (cameraRig) {
@@ -1039,6 +1103,17 @@ renderer.setAnimationLoop((ms) => {
     placeStaticCamera(1, scrollValue * Math.PI * 2 * CONFIG.orbitTurns);
   } else if (CONFIG.scrollEffect === 'dolly') {
     placeStaticCamera(1 + scrollValue * (CONFIG.dollyRange - 1));
+  }
+
+  // Layered on after the camera is placed, so it offsets whatever the clip and
+  // the scroll effects already decided rather than replacing it.
+  if (CONFIG.reactionPush && reaction && reaction.envelope > 0) {
+    const amt = CONFIG.reactionPushAmount * reaction.envelope;
+    camera.updateMatrixWorld(true);
+    _pushRight.setFromMatrixColumn(camera.matrixWorld, 0);
+    _pushUp.setFromMatrixColumn(camera.matrixWorld, 1);
+    camera.position.addScaledVector(_pushRight, reaction.pushX * amt);
+    camera.position.addScaledVector(_pushUp,    reaction.pushY * amt);
   }
 
   updateTweens(dt);
