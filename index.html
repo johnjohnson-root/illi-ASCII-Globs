@@ -64,6 +64,7 @@ const CONFIG = {
   },
 
   noise: true,
+  grainHz: 12,          // grain re-rolls this many times a second (must be > 0)
   matrix: false,        // per-column vertical scroll
   matrixSpeed: 0.15,    // screens per second at max column noise
   smear: 0.0,           // 0..1 — how far up the waterfall collapse reaches
@@ -77,7 +78,7 @@ const CONFIG = {
   // into place while the normal wipe uncovers the surface. Set revealLift to 0
   // for a bare wipe. The lift settles first — ending on the wipe rather than on
   // sliding geometry keeps the last beat still.
-  revealLift:         1.0,
+  revealLift:         0.6,
   revealLiftDuration: 1.0,
 
   // Point this at a .glb to replace the placeholder torus knot. Draco-compressed
@@ -252,6 +253,7 @@ const asciiFrag = /* glsl */`
   uniform float uSmear;
   uniform float uMatrixSpeed;
   uniform float uOutProgress;
+  uniform float uGrainHz;
   uniform bool  uNoise;
   uniform bool  uMatrix;
 
@@ -371,8 +373,12 @@ const asciiFrag = /* glsl */`
     float ascii = texture2D(uCharactersTexture, charUV).r;
 
     // --- grain ---
+    // Quantised time. noise2D is a raw hash, not interpolated, so any nonzero
+    // time delta decorrelates it completely — a plain uTime * rate re-rolls the
+    // pattern every frame no matter how small the rate. Stepping the input is
+    // what actually makes the grain hold still between re-rolls.
     if (uNoise) {
-      float n = noise2D(pixelizedUV * 120.0 + uTime * 0.1);
+      float n = noise2D(pixelizedUV * 120.0 + floor(uTime * uGrainHz) / uGrainHz);
       ascii *= mix(0.6, 1.4, smoothstep(0.5, 0.9, n));
     }
 
@@ -558,6 +564,7 @@ const asciiMaterial = new THREE.ShaderMaterial({
     uSmear:             { value: CONFIG.smear },
     uMatrixSpeed:       { value: CONFIG.matrixSpeed },
     uOutProgress:       { value: CONFIG.outProgress },
+    uGrainHz:           { value: CONFIG.grainHz },
     uNoise:             { value: CONFIG.noise },
     uMatrix:            { value: CONFIG.matrix },
   },
