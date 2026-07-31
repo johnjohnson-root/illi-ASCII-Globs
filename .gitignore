@@ -1,2 +1,6 @@
 # dragonfly.xyz's own model — fine to run locally, not ours to redistribute
 models/dragonfly.glb
+
+# Claude Code local state. launch.json stays: it is the dev-server config.
+.claude/*
+!.claude/launch.json
