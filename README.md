@@ -87,7 +87,7 @@ they can be read straight off the slider:
 ```js
 reactions: {
   left:  { from: 0.20, to: 0.36 },
-  right: { from: 0.78, to: 1.00 },
+  right: { from: 0.82, to: 1.00 },
 },
 ```
 
