@@ -4,3 +4,18 @@ models/dragonfly.glb
 # Claude Code local state. launch.json stays: it is the dev-server config.
 .claude/*
 !.claude/launch.json
+
+# Shell, editor and tool config masked into the working tree by the sandbox.
+# These are /dev/null device nodes, not files — git cannot stage them anyway,
+# and without this they sit in every status and break `git add -A`.
+.bash_profile
+.bashrc
+.gitconfig
+.gitmodules
+.idea
+.mcp.json
+.profile
+.ripgreprc
+.vscode
+.zprofile
+.zshrc
